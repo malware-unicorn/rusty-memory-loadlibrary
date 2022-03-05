@@ -1,6 +1,8 @@
 // cargo build --release --target x86_64-pc-windows-gnu --lib 
 // sudo apt-get install gcc-mingw-w64-x86-64
 // This is a lightweight port of https://github.com/fancycode/MemoryModule
+// TODO: Modules should strive to be below 500 lines
+
 
 // 1) Unhook NTDLL APIs using the PEB
 // 2) Link the ntdll functions to the memory loader
@@ -43,6 +45,8 @@ use winapi::shared::ntdef::{
     NTSTATUS,
     PHANDLE,
     NULL,
+    LIST_ENTRY, 
+    WCHAR,
 };
 use ntapi::ntapi_base::PCLIENT_ID;
 use ntapi::ntpsapi::PPS_ATTRIBUTE_LIST;
@@ -68,6 +72,7 @@ use winapi::um::winnt::{
     IMAGE_DIRECTORY_ENTRY_BASERELOC,
     IMAGE_DIRECTORY_ENTRY_TLS,
     IMAGE_DIRECTORY_ENTRY_IMPORT,
+    IMAGE_IMPORT_DESCRIPTOR,
 };
 use winapi::um::synchapi::{
     Sleep,
@@ -75,11 +80,29 @@ use winapi::um::synchapi::{
 use winapi::um::sysinfoapi::{GetNativeSystemInfo, SYSTEM_INFO};
 use field_offset::offset_of;
 use winapi::ctypes::c_void;
-use winapi::um::processthreadsapi::GetCurrentProcess;
+use winapi::um::processthreadsapi::{
+    GetCurrentProcess,
+    CreateRemoteThread};
 use winapi::um::memoryapi::{WriteProcessMemory,ReadProcessMemory};
 use winapi::vc::vcruntime::ptrdiff_t;
-use winapi::um::winbase::IsBadReadPtr;
-
+use winapi::um::winbase::{
+    IsBadReadPtr, 
+    lstrlenW,
+    INFINITE};
+use std::ffi::CString;
+use std::ffi::CStr;
+use ntapi::ntpsapi::{
+    NtQueryInformationProcess,
+    PROCESS_BASIC_INFORMATION, 
+    PPROCESS_BASIC_INFORMATION,
+    ProcessBasicInformation};
+use ntapi::ntpebteb::PEB;
+use ntapi::ntpsapi::PEB_LDR_DATA;
+use ntapi::ntldr::{LDR_DATA_TABLE_ENTRY,LDR_DATA_TABLE_ENTRY_u1};
+use std::ffi::{ OsStr, OsString};
+use std::os::windows::ffi::OsStrExt;
+use std::os::windows::prelude::OsStringExt;
+use std::slice;
 
 // Convert address into function
 macro_rules! example {
@@ -144,7 +167,7 @@ struct FunctionMap {
     //writemem: PNtWriteVirtualMemory,
     //createthread: PNtCreateThreadEx,
     load_libary: PLoadLibraryA,
-    get_proc_addres: PCustomGetProcAddress,
+    get_proc_address: PCustomGetProcAddress,
     free_libary: PFreeLibary,
     virtual_alloc: PVirtualAllocEx,
     virtal_free: PVirtualFreeEx
@@ -178,6 +201,8 @@ struct MemoryModule {
 
 pub const DOS_SIGNATURE: u16 = 0x5a4d;
 pub const PE_SIGNATURE: u32 = 0x00004550;
+pub const MAX_DLL_NAME: usize = 33;
+pub const MAX_DLL_FUNC_NAME: usize = 63;
 
 fn unhook_ntdll()->u32 {
     0
@@ -185,6 +210,159 @@ fn unhook_ntdll()->u32 {
 
 unsafe extern "system" fn _default_loadlibrary(lp_filename: PVOID) -> u32 {
     return LoadLibraryA(lp_filename as LPCSTR) as u32
+}
+
+// Load the library with createremotethread
+unsafe extern "system" fn _remotethread_loadlibrary(
+    mem_module: *mut MemoryModule, 
+    lp_filename: &str) -> HMODULE {
+    let proc_handle = (*mem_module).h_prochandle;
+    let virtual_alloc = unsafe {(*mem_module).functions.virtual_alloc};
+    let get_proc_addr = unsafe { (*mem_module).functions.get_proc_address };
+    
+    // Get address to loadlibrary
+    let h_kernel = _sneaky_loadlibrary(mem_module, "kernel32.dll");
+    let proc_name = CString::new("LoadLibraryA").expect("invalid proc name");
+    // TODO: check if this works in remote process
+    let loadlibrary_addr = get_proc_addr(h_kernel, proc_name.as_ptr());
+    println!("LoadLibraryA proc_addr {:#x}", loadlibrary_addr as u64);
+
+    // write path to remote process
+    let dll_path_buf = lp_filename.as_bytes().to_vec();
+    let buf_len = dll_path_buf.len()+1;
+    // create buffer
+    // virtualalloc
+    let memory_address = virtual_alloc(
+        proc_handle, 
+        NULL, 
+        buf_len, 
+        MEM_COMMIT as u32,
+        PAGE_READWRITE);
+    // writeprocessmemory
+    let mut bytes_written = 0;
+    let _status = unsafe {_default_memwrite(
+        proc_handle,
+        memory_address,
+        dll_path_buf.as_ptr() as LPCVOID,
+        buf_len as usize,
+        &mut bytes_written,
+    )};
+    let loadlib = example!(loadlibrary_addr, PLoadLibraryA);
+
+    let remote_thread = CreateRemoteThread(
+        proc_handle, 
+        std::ptr::null_mut(), 
+        0, 
+        Some(loadlib), 
+        memory_address as PVOID, 
+        0, 
+        std::ptr::null_mut());
+    if remote_thread == 0 as HANDLE {
+        println!("remote_thread failed");
+        return 0 as HMODULE;
+    }
+    WaitForSingleObject(remote_thread, INFINITE);
+    let new_module = _sneaky_loadlibrary(mem_module, lp_filename);
+    if new_module == 0 as HMODULE {
+        println!("{} failed to load remotely", lp_filename);
+        return 0 as HMODULE;
+    }
+    new_module
+}
+
+// 1) Look up from the PEB
+//   a) Alloc PROCESS_BASIC_INFORMATION to heap
+//   b) NTQueryInformationProcess,  PROCESS_BASIC_INFORMATION
+//   c) pPeb = BasicInfo.PebBaseAddress
+//   d) Reading the PEB -> ReadProcessMemory(hProcess, pbi->PebBaseAddress, &peb, sizeof(peb), &dwBytesRead)
+//   e) Get the exports
+unsafe extern "system" fn _sneaky_loadlibrary(
+    mem_module: *mut MemoryModule, 
+    lp_filename: &str) -> HMODULE {
+    let proc_handle = (*mem_module).h_prochandle;
+    // Remote Proc PEB
+    let mut buffer_size = mem::size_of::<PROCESS_BASIC_INFORMATION>() as u32;
+    let mut pbi_buffer: Box<[u8]> = vec![0; buffer_size as usize].into_boxed_slice();
+    let mut pbi_ptr = pbi_buffer.as_mut_ptr().cast::<_>() as *mut PROCESS_BASIC_INFORMATION;
+    let mut status = NtQueryInformationProcess(
+        proc_handle,
+        ProcessBasicInformation, 
+        pbi_ptr as PVOID, 
+        buffer_size, 
+        &mut buffer_size);
+    if status != 0 {
+        println!("NtQueryInformationProcess status {:#x}", status);
+        return 0 as HMODULE;
+    }
+    let peb_ptr = (*pbi_ptr).PebBaseAddress as u64;
+    println!("peb_ptr {:#x}", peb_ptr);
+    let mut buf = vec![0; mem::size_of::<PEB>()];
+    let mut bytes_read: usize = 0;
+    // Read PEB
+    _default_memread(
+        proc_handle,
+        peb_ptr as LPCVOID,
+        buf.as_mut_ptr() as LPVOID,
+        mem::size_of::<PEB>(),
+        &mut bytes_read);
+    let mut temp = std::ptr::read(buf.as_mut_ptr() as *const _);
+    let mut ppeb: &mut PEB = &mut temp;
+    let peb_ldr_ptr = (*ppeb).Ldr as u64;
+    println!("peb_ldr_ptr {:#x}", peb_ldr_ptr);
+    // Read PEB_LDR_DATA 
+    let mut ldr_buf = vec![0; mem::size_of::<PEB_LDR_DATA>()];
+    _default_memread(
+        proc_handle,
+        peb_ldr_ptr as LPCVOID,
+        ldr_buf.as_mut_ptr() as LPVOID,
+        mem::size_of::<PEB_LDR_DATA>(),
+        &mut bytes_read);
+    let mut ldr_temp = std::ptr::read(ldr_buf.as_mut_ptr() as *const _);
+    let mut ppeb_ldr_data: &mut PEB_LDR_DATA = &mut ldr_temp;
+    let mem_order_module_list = (*ppeb_ldr_data).InMemoryOrderModuleList;
+    let mut list_entry_ptr = mem_order_module_list.Flink as u64;
+    let mut list_end = mem_order_module_list.Flink as u64;
+    
+    let mut ldr_entry_buf = vec![0; mem::size_of::<LDR_DATA_TABLE_ENTRY>()];
+    let mut k = 0;
+    loop {
+        //println!("list_entry_ptr {:#x}", list_entry_ptr);
+        _default_memread(
+            proc_handle,
+            list_entry_ptr as LPCVOID,
+            ldr_entry_buf.as_mut_ptr() as LPVOID,
+            mem::size_of::<LDR_DATA_TABLE_ENTRY>(),
+            &mut bytes_read);
+        let mut ldr_entry_temp = std::ptr::read(ldr_entry_buf.as_mut_ptr() as *const _);
+        let mut p_ldr_data_table_entry: &mut LDR_DATA_TABLE_ENTRY = &mut ldr_entry_temp;
+
+        let full_name_ptr = (*p_ldr_data_table_entry).FullDllName.Buffer as u64;
+        //println!("full_name_ptr {:#x}", full_name_ptr);
+        let full_name_len = (*p_ldr_data_table_entry).FullDllName.Length as usize;
+        let mut full_name_buf = vec![0; full_name_len];
+        _default_memread(
+            proc_handle,
+            full_name_ptr as LPCVOID,
+            full_name_buf.as_mut_ptr() as LPVOID,
+            full_name_len,
+            &mut bytes_read);
+        
+        let name_cstring = buff_to_str_w(full_name_buf);
+        let name_str = name_cstring.as_c_str().to_str().unwrap();
+        // println!("full_name {} {}", name_str, lp_filename);
+        if lp_filename.eq_ignore_ascii_case(name_str) {
+            let ldr_data_u1 = (*p_ldr_data_table_entry).u1;
+            let dll_hmodule = ldr_data_u1.InInitializationOrderLinks.Flink;
+            //println!("dll_hmodule {:#x}", dll_hmodule as u64);
+            return dll_hmodule as HMODULE;
+        }
+        // pListEntry = pListEntry->Flink;
+        list_entry_ptr = (*p_ldr_data_table_entry).InLoadOrderLinks.Flink as u64;
+        if list_entry_ptr == list_end {
+            break;
+        }
+    }
+    0 as HMODULE
 }
 
 unsafe extern "system" fn _default_getprocaddress(h_module: HMODULE, lp_proc_name: LPCSTR) -> FARPROC {
@@ -266,6 +444,7 @@ fn align_value_up(value: u64, alignment: u64) -> u64 {
     return (value + alignment - 1) & !(alignment - 1);
 }
 
+// TODO: function too big, refactor later
 fn copy_sections(
     data: PVOID, 
     size: usize, 
@@ -450,7 +629,6 @@ fn perform_base_relocations(
     unsafe {
         let mut temp = std::ptr::read(buf.as_mut_ptr() as *const _);
         let mut relocation: &mut IMAGE_BASE_RELOCATION = &mut temp;
-        let mut j = 0;
         while (*relocation).VirtualAddress > 0 {
             // println!("RVA {:#x}", (*relocation).VirtualAddress);
             let dest = code_base as u64 + (*relocation).VirtualAddress as u64;
@@ -525,15 +703,128 @@ fn perform_base_relocations(
     true
 }
 
-fn build_import_table(mem_module: *mut MemoryModule) -> bool {
-
+unsafe fn buff_to_str_w(buf: Vec<u16>) -> CString {
+    let slice = buf.as_slice();
+    let full_name_ostr: OsString = OsStringExt::from_wide(slice);
+    let full_name_str: &str = full_name_ostr.to_str().unwrap();
+    let name_cstring = buff_to_str(full_name_str.as_bytes().to_vec());
+    return name_cstring;
 }
 
+unsafe fn buff_to_str(buf: Vec<u8>) -> CString{
+    let name_cstr = CString::from_vec_unchecked(buf);
+    let name_raw = name_cstr.into_raw();
+    return CString::from_raw(name_raw);
+}
+
+// 1) Check if self proc handle
+// 2) Look up from the PEB
+//   a) Alloc PROCESS_BASIC_INFORMATION to heap
+//   b) NTQueryInformationProcess,  PROCESS_BASIC_INFORMATION
+//   c) pPeb = BasicInfo.PebBaseAddress
+//   d) Reading the PEB -> ReadProcessMemory(hProcess, pbi->PebBaseAddress, &peb, sizeof(peb), &dwBytesRead)
+//   e) Get the exports
+// 3) If doesn't exists, call loadlibrary (worst case)
+// TODO: function too big. refactor later
+fn build_import_table(
+    nt_ptr: *mut IMAGE_NT_HEADERS, mem_module: *mut MemoryModule) -> bool {
+    let code_base = unsafe {(*mem_module).code_base};
+    let proc_handle = unsafe { (*mem_module).h_prochandle };
+    let get_proc_addr = unsafe { (*mem_module).functions.get_proc_address };
+    let directory = get_header_dictionary(
+        nt_ptr, IMAGE_DIRECTORY_ENTRY_IMPORT as usize);
+    unsafe {
+        if (*directory).Size == 0 {
+            return false;
+        }
+    }
+    let mut import_desc_ptr = unsafe { code_base as u64 + (*directory).VirtualAddress as u64 };
+    let import_dir_size =  unsafe { (*directory).Size };
+    let import_desc_size = mem::size_of::<IMAGE_IMPORT_DESCRIPTOR>();
+    println!("import_dir_size {:#x}", import_dir_size);
+    let mut buf = vec![0; import_desc_size as usize];
+    let mut bytes_read: usize = 0;
+    let _result = unsafe {_default_memread(
+        proc_handle,
+        import_desc_ptr as LPCVOID,
+        buf.as_mut_ptr() as LPVOID,
+        import_desc_size,
+        &mut bytes_read)};
+    if bytes_read != import_desc_size {
+        println!("failed to read directory!");
+        return false;
+    }
+    unsafe {
+        let mut temp = std::ptr::read(buf.as_mut_ptr() as *const _);
+        let mut import_desc: &mut IMAGE_IMPORT_DESCRIPTOR = &mut temp;
+        println!("import_desc_ptr {:#x} size {:#x}", 
+            import_desc_ptr, code_base as u64 + import_dir_size as u64);
+        let import_dir_len = code_base as u64 + (*directory).VirtualAddress as u64 + import_dir_size as u64;
+        while import_desc_ptr < import_dir_len && (*import_desc).Name != 0 {
+            // println!("Name ptr {:#x}", (*import_desc).Name);
+            let name_ptr = code_base as u64 + (*import_desc).Name as u64;
+            let mut name_buf = vec![0; MAX_DLL_NAME];
+            let mut name_bytes_read: usize = 0;
+            _default_memread(
+                proc_handle,
+                name_ptr as LPCVOID,
+                name_buf.as_mut_ptr() as LPVOID,
+                MAX_DLL_NAME,
+                &mut name_bytes_read);
+        
+            let name_cstring = buff_to_str(name_buf);
+            let name_str = name_cstring.as_c_str().to_str().unwrap();
+            //println!("name buf {}", name_str);
+            // LoadLibrary
+            let mut dll_module = _sneaky_loadlibrary(mem_module, name_str);
+            if dll_module == 0 as HMODULE {
+                println!("DLL module {} not found, trying to load", name_str);
+                dll_module = _remotethread_loadlibrary(mem_module, name_str);
+                if dll_module == 0 as HMODULE {
+                    println!("DLL module {} not found, trying to load", name_str);
+                    return false;
+                }
+            } 
+            println!("DLL module {} {:#x}", name_str, dll_module as u64);
+            // TODO: add to list of modules
+            let mut thunk_ref:u64 = 0;
+            let mut func_ref: u64 = 0;
+            let original_first_thunk = (*import_desc).u.OriginalFirstThunk() as u64;
+            let first_thunk = (*import_desc).FirstThunk as u64;
+            if original_first_thunk != 0 {
+                thunk_ref = code_base + original_first_thunk;
+                func_ref = code_base + first_thunk;
+            } else {
+                // no hint table
+                thunk_ref = code_base + first_thunk;
+                func_ref = code_base + first_thunk;
+            }
+            // Loop through thunks
+
+
+
+            
+            import_desc_ptr = import_desc_ptr + import_desc_size as u64;
+            // println!("import_desc_ptr {:#x}", import_desc_ptr, );
+            _default_memread(
+                proc_handle,
+                import_desc_ptr as LPCVOID,
+                buf.as_mut_ptr() as LPVOID,
+                import_desc_size,
+                &mut bytes_read);
+            temp = std::ptr::read(buf.as_mut_ptr() as *const _);
+            import_desc = &mut temp;
+        }
+    }
+    true
+}
+
+// TODO: Get debug privileges
 fn memory_loadlibrary_ex(
     data: PVOID, 
     size: u32,
     load_libary: PLoadLibraryA,
-    get_proc_addres: PCustomGetProcAddress,
+    get_proc_address: PCustomGetProcAddress,
     free_libary: PFreeLibary,
     virtual_alloc: PVirtualAllocEx,
     virtal_free: PVirtualFreeEx)->u32{
@@ -647,7 +938,7 @@ fn memory_loadlibrary_ex(
         is_relocated: false,
         functions: FunctionMap {
             load_libary: load_libary,
-            get_proc_addres: get_proc_addres,
+            get_proc_address: get_proc_address,
             free_libary: free_libary,
             virtual_alloc: virtual_alloc,
             virtal_free: virtal_free,
@@ -704,12 +995,12 @@ fn memory_loadlibrary_ex(
         memory_module.is_relocated = true;
     }
 
-    unsafe { Sleep(0x10000) };
     // load required dlls and adjust function table of imports
-    if !build_import_table(&mut memory_module) {
+    if !build_import_table(nt_ptr, &mut memory_module) {
         println!("build_import_table failed!");
         return 0;
     }
+    unsafe { Sleep(0x6000) };
     // mark memory pages depending on section headers and release
     // sections that are marked as "discardable"
     // TLS callbacks are executed BEFORE the main loading
