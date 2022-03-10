@@ -261,7 +261,7 @@ unsafe extern "system" fn _remotethread_loadlibrary(
     
     // Get address to loadlibrary
     let h_kernel = _sneaky_loadlibrary(mem_module, "kernel32.dll");
-    let proc_name = CString::new("LoadLibraryA").expect("invalid proc name");
+    let proc_name = CString::new("LoadLibraryA").unwrap();
     // TODO: check if this works in remote process
     let loadlibrary_addr = get_proc_addr(h_kernel, proc_name.as_ptr());
     println!("LoadLibraryA proc_addr {:#x}", loadlibrary_addr as u64);
@@ -311,11 +311,11 @@ unsafe extern "system" fn _remotethread_loadlibrary(
 }
 
 // 1) Look up from the PEB
-//   a) Alloc PROCESS_BASIC_INFORMATION to heap
-//   b) NTQueryInformationProcess,  PROCESS_BASIC_INFORMATION
-//   c) pPeb = BasicInfo.PebBaseAddress
-//   d) Reading the PEB -> ReadProcessMemory(hProcess, pbi->PebBaseAddress, &peb, sizeof(peb), &dwBytesRead)
-//   e) Get the exports
+    //   a) Alloc PROCESS_BASIC_INFORMATION to heap
+    //   b) NTQueryInformationProcess,  PROCESS_BASIC_INFORMATION
+    //   c) pPeb = BasicInfo.PebBaseAddress
+    //   d) Reading the PEB -> ReadProcessMemory(hProcess, pbi->PebBaseAddress, &peb, sizeof(peb), &dwBytesRead)
+    //   e) Get the exports
 unsafe extern "system" fn _sneaky_loadlibrary(
     mem_module: *mut MemoryModule, 
     lp_filename: &str) -> HMODULE {
@@ -1406,7 +1406,7 @@ fn memory_loadlibrary_ex(
         return 0;
     }
 
-    // unsafe { Sleep(0x6000) };
+    
     
     // get entry point of loaded library
     if optional_header.AddressOfEntryPoint != 0 {
@@ -1416,7 +1416,7 @@ fn memory_loadlibrary_ex(
             println!("dll_entry_ptr {:#x}", dll_entry_ptr);
             let dll_entry_func = unsafe { example!(dll_entry_ptr, DllEntryProc)};
             
-            
+            unsafe { Sleep(0x6000) };
             let result = unsafe { dll_entry_func(memory_module.code_base as HINSTANCE , DLL_PROCESS_ATTACH, NULL) };
             if result == 0 as BOOL {
                 println!("dll entry failed!");
