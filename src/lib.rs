@@ -3,9 +3,8 @@
 // This is a lightweight port of https://github.com/fancycode/MemoryModule
 // TODO: Modules should strive to be below 500 lines
 
-
-// 1) Unhook NTDLL APIs using the PEB
-// 2) Link the ntdll functions to the memory loader
+// TODO: [DATE: 4/11] Fix updating the remote physical address in the header before copying!
+// TODO: [FUTURE] Unhook NTDLL APIs using the PEB
 extern crate winapi;
 
 use std::mem;
@@ -128,13 +127,6 @@ macro_rules! example {
         std::mem::transmute::<*const (), $t>($address as _)
     };
 }
-
-// TODO: Unhook the following API calls
-// OpenProcess -> NtOpenProcess
-// VirtualAllocEx-> NtAllocateVirtualMemory
-// WriteProcessMemory -> NtWriteVirtualMemory
-// CreateRemoteThread -> NtCreateThreadEx
-// ReadVirtualMemory ->NtReadVirtualMemory 
 
 // Kernel32.dll::LoadLibraryA
 type PLoadLibraryA =  unsafe extern "system" fn (lp_filename: PVOID) -> u32;
@@ -262,19 +254,18 @@ unsafe extern "system" fn _remotethread_loadlibrary(
     // Get address to loadlibrary
     let h_kernel = _sneaky_loadlibrary(mem_module, "kernel32.dll");
     let proc_name = CString::new("LoadLibraryA").unwrap();
-    // TODO: check if this works in remote process
     let loadlibrary_addr = get_proc_addr(h_kernel, proc_name.as_ptr());
-    println!("LoadLibraryA proc_addr {:#x}", loadlibrary_addr as u64);
-
+    // println!("LoadLibraryA proc_addr {:#x}", loadlibrary_addr as u64);
+    let loadlib = example!(loadlibrary_addr, PLoadLibraryA);
     // write path to remote process
     let dll_path_buf = lp_filename.as_bytes().to_vec();
-    let buf_len = dll_path_buf.len()+1;
+    let buf_len = dll_path_buf.len();
     // create buffer
     // virtualalloc
     let memory_address = virtual_alloc(
         proc_handle, 
         NULL, 
-        buf_len, 
+        buf_len+1, 
         MEM_COMMIT as u32,
         PAGE_READWRITE);
     // writeprocessmemory
@@ -286,7 +277,7 @@ unsafe extern "system" fn _remotethread_loadlibrary(
         buf_len as usize,
         &mut bytes_written,
     );
-    let loadlib = example!(loadlibrary_addr, PLoadLibraryA);
+    
 
     let remote_thread = CreateRemoteThread(
         proc_handle, 
@@ -297,16 +288,24 @@ unsafe extern "system" fn _remotethread_loadlibrary(
         0, 
         std::ptr::null_mut());
     if remote_thread == 0 as HANDLE {
-        println!("remote_thread failed");
+        println!("loadlibrary remote_thread failed");
         return 0 as HMODULE;
     }
     WaitForSingleObject(remote_thread, INFINITE);
-    Sleep(0x100);
-    let new_module = _sneaky_loadlibrary(mem_module, lp_filename);
-    if new_module == 0 as HMODULE {
-        println!("{} failed to load remotely", lp_filename);
-        return 0 as HMODULE;
+    Sleep(0x2000);
+    let mut retry = 0;
+    let mut new_module = 0 as HMODULE;
+    while new_module == 0 as HMODULE {
+        new_module = _sneaky_loadlibrary(mem_module, lp_filename);
+        if retry > 3 && new_module == 0 as HMODULE {
+            println!("{} failed to load remotely", lp_filename);
+            return 0 as HMODULE;
+        }
+        println!("retry attempt {} {}", retry, lp_filename);
+        Sleep(0x1000);
+        retry = retry +1;
     }
+    // TODO: Virtual Free
     new_module
 }
 
@@ -335,7 +334,7 @@ unsafe extern "system" fn _sneaky_loadlibrary(
         return 0 as HMODULE;
     }
     let peb_ptr = (*pbi_ptr).PebBaseAddress as u64;
-    println!("peb_ptr {:#x}", peb_ptr);
+    // println!("peb_ptr {:#x}", peb_ptr);
     let mut buf = vec![0; mem::size_of::<PEB>()];
     let mut bytes_read: usize = 0;
     // Read PEB
@@ -348,7 +347,7 @@ unsafe extern "system" fn _sneaky_loadlibrary(
     let mut temp = std::ptr::read(buf.as_mut_ptr() as *const _);
     let ppeb: &mut PEB = &mut temp;
     let peb_ldr_ptr = (*ppeb).Ldr as u64;
-    println!("peb_ldr_ptr {:#x}", peb_ldr_ptr);
+    // println!("peb_ldr_ptr {:#x}", peb_ldr_ptr);
     // Read PEB_LDR_DATA 
     let mut ldr_buf = vec![0; mem::size_of::<PEB_LDR_DATA>()];
     _default_memread(
@@ -357,7 +356,7 @@ unsafe extern "system" fn _sneaky_loadlibrary(
         ldr_buf.as_mut_ptr() as LPVOID,
         mem::size_of::<PEB_LDR_DATA>(),
         &mut bytes_read);
-    let mut ldr_temp = std::ptr::read(ldr_buf.as_mut_ptr() as *const _);
+    let mut ldr_temp = std::ptr::read(ldr_buf.as_mut_ptr() as *const PEB_LDR_DATA);
     let ppeb_ldr_data: &mut PEB_LDR_DATA = &mut ldr_temp;
     let mem_order_module_list = (*ppeb_ldr_data).InMemoryOrderModuleList;
     let mut list_entry_ptr = mem_order_module_list.Flink as u64;
@@ -372,7 +371,7 @@ unsafe extern "system" fn _sneaky_loadlibrary(
             ldr_entry_buf.as_mut_ptr() as LPVOID,
             mem::size_of::<LDR_DATA_TABLE_ENTRY>(),
             &mut bytes_read);
-        let mut ldr_entry_temp = std::ptr::read(ldr_entry_buf.as_mut_ptr() as *const _);
+        let mut ldr_entry_temp = std::ptr::read(ldr_entry_buf.as_mut_ptr() as *const LDR_DATA_TABLE_ENTRY);
         let p_ldr_data_table_entry: &mut LDR_DATA_TABLE_ENTRY = &mut ldr_entry_temp;
 
         let full_name_ptr = (*p_ldr_data_table_entry).FullDllName.Buffer as u64;
@@ -409,6 +408,12 @@ unsafe extern "system" fn _default_getprocaddress(h_module: HMODULE, lp_proc_nam
         h_module, 
         lp_proc_name);
 }
+
+// TODO: https://www.codeproject.com/Tips/139349/Getting-the-address-of-a-function-in-a-DLL-loaded
+unsafe extern "system" fn _remote_getprocaddress(h_module: HMODULE, lp_proc_name: LPCSTR) -> FARPROC {
+    return 0
+}
+
 
 unsafe extern "system" fn _default_freelibrary(h_module: HMODULE) -> BOOL {
     return FreeLibrary(h_module);
@@ -470,8 +475,23 @@ pub fn memory_loadlibary(data: PVOID, size: u32)->u32{
         _default_freelibrary,
         _default_virtualalloc,
         _default_virtualfree,
+        NULL,
     );
 }
+
+pub fn memory_loadlibary_remote(data: PVOID, size: u32, phandle: HANDLE ) ->u32{
+    return memory_loadlibrary_ex(
+        data, 
+        size,
+        _default_loadlibrary,
+        _default_getprocaddress,
+        _default_freelibrary,
+        _default_virtualalloc,
+        _default_virtualfree,
+        phandle,
+    );
+}
+
 fn check_size(size: u64, expected: u64) -> bool {
     if size < expected {
         println!("check_size failed! {} {}", size, expected);
@@ -527,8 +547,11 @@ fn copy_sections(
                 _dest = (code_base as u64 + section.VirtualAddress as u64) as PVOID;
                 unsafe {
                     let mut physical_addr = (*image_first_section_ptr).Misc.PhysicalAddress_mut();
-                    (*physical_addr) = (_dest as u64 & 0xffffffff) as DWORD;
-                    // println!("section {} {:#x}", i, (*physical_addr));
+                    // NOTE: On 64bit systems we truncate to 32bit here but expand
+                    // again later when "PhysicalAddress" is used.
+                    (*physical_addr) = (_dest as u64 & 0xffffffff) as DWORD; //TODO: make sure this writes in remote process
+                    println!("section {} physical_addr {:#x}", i, (*physical_addr));
+                    // TODO: figure out how to write this to remote process
                 }
                 // memset(dest, 0, section_size);
                 let null_bytes = vec![0; section_size as usize];
@@ -561,8 +584,10 @@ fn copy_sections(
             _dest = (code_base as u64 + section.VirtualAddress as u64) as PVOID;
             unsafe {
                 let mut physical_addr = (*image_first_section_ptr).Misc.PhysicalAddress_mut();
+                // NOTE: On 64bit systems we truncate to 32bit here but expand
+                // again later when "PhysicalAddress" is used.
                 (*physical_addr) = (_dest as u64 & 0xffffffff) as DWORD; //TODO: make sure this writes in remote process
-                // println!("section {} {:#x}", i, (*physical_addr));
+                println!("section {} physical_addr {:#x}", i, (*physical_addr));
             }
             // memcopy
             let mut bytes_written = 0;
@@ -710,7 +735,7 @@ fn perform_base_relocations(
                 let addr_hl_info: &mut u64 = &mut addr_hl_bytes;
                 match rel_type {
                     IMAGE_REL_BASED_HIGHLOW => {
-                        //println!("IMAGE_REL_BASED_HIGHLOW {:#x}={:#x}", patch_addr_hl, rel_offset);
+                        //println!("IMAGE_REL_BASED_HIGHLOW {:#x}={:#x}", patch_addr_hl as u32, rel_offset);
                         // patch location
                         let mut bytes_written = 0;
                         let new_patch = (*addr_hl_info) as isize + delta;
@@ -728,6 +753,8 @@ fn perform_base_relocations(
                         //println!("IMAGE_REL_BASED_DIR64 {:#x}={:#x}", patch_addr_hl, rel_offset);
                         let mut bytes_written = 0;
                         let new_patch = (*addr_hl_info) as isize  + delta;
+
+                        //println!("IMAGE_REL_BASED_DIR64 {:#x}={:#x}", *addr_hl_info, new_patch);
                         let delta_buf = ((new_patch as u64).to_le_bytes()).to_vec();
                         let _status =_default_memwrite(
                             proc_handle,
@@ -832,9 +859,10 @@ fn build_import_table(
         
             let name_cstring = buff_to_str(name_buf);
             let name_str = name_cstring.as_c_str().to_str().unwrap();
-            //println!("name buf {}", name_str);
+            println!("name buf {}", name_str);
             // LoadLibrary
-            let mut dll_module = _sneaky_loadlibrary(mem_module, name_str);
+            //let mut dll_module = _sneaky_loadlibrary(mem_module, name_str);
+            let mut dll_module = _remotethread_loadlibrary(mem_module, name_str);
             if dll_module == 0 as HMODULE {
                 println!("DLL module {} not found, trying to load", name_str);
                 dll_module = _remotethread_loadlibrary(mem_module, name_str);
@@ -848,7 +876,7 @@ fn build_import_table(
             let mut _thunk_ref:u64 = 0;
             let mut _func_ref: u64 = 0;
             let original_first_thunk: u64 = *((*import_desc).u.OriginalFirstThunk()) as u64; //TODO: see if this works in remote process
-            //println!("original_first_thunk {:#x}", original_first_thunk);
+            // println!("original_first_thunk {:#x}", original_first_thunk);
             let first_thunk = (*import_desc).FirstThunk as u64;
             if original_first_thunk != 0 {
                 _thunk_ref = code_base + original_first_thunk;
@@ -869,13 +897,14 @@ fn build_import_table(
                     thunk_buf.as_mut_ptr() as LPVOID,
                     mem::size_of::<u64>(),
                     &mut thunk_bytes_read);
-                let mut thunk_into_bytes = std::ptr::read(thunk_buf.as_mut_ptr() as *const _);
+                let mut thunk_into_bytes = std::ptr::read(thunk_buf.as_mut_ptr() as *const u64);
                 let thunk_addr: &mut u64 = &mut thunk_into_bytes;
                 //println!("thunk_addr {:#x}", *thunk_addr);
+                
                 let snapped_thunk = IMAGE_SNAP_BY_ORDINAL(*thunk_addr) as u64;
                 //println!("snapped_thunk {:#x}", snapped_thunk);
                 let mut _func_ref_value_ptr = 0;
-                if snapped_thunk != 0 {
+                if *thunk_addr != 0 && snapped_thunk != 0 {
                     let ordinal_name_ptr = IMAGE_ORDINAL(*thunk_addr);
                     let proc_addr = get_proc_addr(dll_module, ordinal_name_ptr as LPCSTR);
                     //println!("proc_addr {:#x}", proc_addr as u64);
@@ -890,13 +919,34 @@ fn build_import_table(
                         &mut bytes_written,
                     );
                     _func_ref_value_ptr = proc_addr as u64;
-                } else {
+                } else if *thunk_addr != 0 {
                     //IMAGE_IMPORT_BY_NAME hack
                     let image_import_ptr = code_base + (*thunk_addr) as u64;
                     let proc_name_ptr = image_import_ptr + mem::size_of::<WORD>() as u64;
-                    //println!("proc_name_ptr {:#x}", proc_name_ptr as u64);
-                    let proc_addr = get_proc_addr(dll_module, proc_name_ptr as LPCSTR);
-                    //println!("proc_addr {:#x}", proc_addr as u64);
+
+                    let mut funcname_buf = vec![0; _MAX_DLL_FUNC_NAME];
+                    let mut funcname_bytes_read: usize = 0;
+                    _default_memread(
+                        proc_handle,
+                        proc_name_ptr as LPCVOID,
+                        funcname_buf.as_mut_ptr() as LPVOID,
+                        _MAX_DLL_FUNC_NAME,
+                        &mut funcname_bytes_read);
+                    
+                    //println!("bytes read {:#?}", funcname_buf);
+                    let funcname_cstring = buff_to_str(funcname_buf);
+                    
+                    let funcname_str = funcname_cstring.as_c_str().to_str().unwrap();
+
+                    // TODO: https://www.codeproject.com/Tips/139349/Getting-the-address-of-a-function-in-a-DLL-loaded
+                    let proc_addr = get_proc_addr(dll_module, funcname_cstring.as_ptr() as LPCSTR);
+                    if proc_addr as u64 == 0 {
+                        println!("name_cstring {:x?}", funcname_cstring);
+                        println!("name buf {}", funcname_str);
+                        println!("proc_addr {:#x}", proc_addr as u64);
+                        println!("_func_ref {:#x}", _func_ref as u64);
+                    }
+                    
                     // write thunk_ref
                     let mut bytes_written = 0;
                     let func_ref_value = ((proc_addr as u64).to_le_bytes()).to_vec();
@@ -908,6 +958,7 @@ fn build_import_table(
                         &mut bytes_written,
                     );
                     _func_ref_value_ptr = proc_addr as u64;
+                    //println!("_func_ref_value_ptr {:#x}", _func_ref_value_ptr as u64);
                 }
                 if _func_ref_value_ptr == 0 {
                     break;
@@ -917,7 +968,7 @@ fn build_import_table(
                 _func_ref = _func_ref + mem::size_of::<u64>() as u64;
             }
             import_desc_ptr = import_desc_ptr + import_desc_size as u64;
-            // println!("import_desc_ptr {:#x}", import_desc_ptr, );
+            //println!("import_desc_ptr {:#x}", import_desc_ptr, );
             _default_memread(
                 proc_handle,
                 import_desc_ptr as LPCVOID,
@@ -1009,11 +1060,15 @@ fn finalize_sections(
     
     section = unsafe { *image_first_section_ptr };
 
-    
+    // "PhysicalAddress" might have been truncated to 32bit above, expand to
+    // 64bits again.
     let imageOffset = optional_header.ImageBase as u64 & 0xffffffff00000000;
+    //let imageOffset = 0;
     let physical_addr = unsafe {section.Misc.PhysicalAddress_mut()};
-    // println!("Section {} {:#x}", 0, (*physical_addr));
+    
     let section_addr = ((*physical_addr) as u64 | imageOffset) as u64;
+
+    println!("Section {} {:#x} with offset {:#x}", 0, (*physical_addr), section_addr);
     let mut section_data = SectionFinalizedData{
         address: section_addr,
         aligned_address: align_address_down(section_addr, page_size as u64),
@@ -1030,7 +1085,7 @@ fn finalize_sections(
         let physical_address = unsafe {section.Misc.PhysicalAddress_mut()};
         
         let section_address = ((*physical_address) as u64 | imageOffset) as u64;
-        // println!("Section {} {:#x}", i, (*physical_address));
+        println!("Section {} {:#x} with offset {:#x}", 0, (*physical_address), section_address);
         let aligned_address = align_address_down(section_address, page_size as u64);
         let section_size = get_real_section_size(nt_ptr, &section);
         if section_data.aligned_address == aligned_address || section_data.address + section_data.size as u64 > aligned_address {
@@ -1063,15 +1118,13 @@ fn finalize_sections(
     true
 }
 
-// TODO: refactor this
-fn execute_tls(nt_ptr: *mut IMAGE_NT_HEADERS, mem_module: *mut MemoryModule)->bool {
-    let code_base = unsafe {(*mem_module).code_base};
+fn create_func_wrapper(mem_module: *mut MemoryModule) -> (u64, u64) {
     let proc_handle = unsafe { (*mem_module).h_prochandle };
     let virtual_alloc = unsafe {(*mem_module).functions._virtual_alloc};
     let mut bytes_written: usize = 0;
     let mut bytes_read: usize = 0;
-    // CreateRemoteThread uses fastcall
-    /* TLS callback wrapper using fastcall
+    // func(arg1, arg2, arg3)
+    /* Function wrapper using fastcall
         push    rbp
         mov     rbp, rsp
         mov     rbx, rcx
@@ -1118,16 +1171,30 @@ fn execute_tls(nt_ptr: *mut IMAGE_NT_HEADERS, mem_module: *mut MemoryModule)->bo
         76,
         MEM_COMMIT as u32,
         PAGE_READWRITE,
-    )};    
+    )};
+
+    (tls_wrapper_func as u64, parameter_ptr as u64)
+}
+
+fn setup_wrapper_params(
+    mem_module: *mut MemoryModule, 
+    parameter_ptr: u64, 
+    arg0_func: u64, 
+    arg1: u64, 
+    arg2: u64, 
+    arg3: u64) -> i32 {
+    let proc_handle = unsafe { (*mem_module).h_prochandle };
+    let mut bytes_written: usize = 0;
+    
     let mut arg0_ptr = ((parameter_ptr as u64 + (mem::size_of::<u64>() as u64 * 5)).to_le_bytes()).to_vec();
     let mut arg1_ptr = ((parameter_ptr as u64 + (mem::size_of::<u64>() as u64 * 6)).to_le_bytes()).to_vec();
     let mut arg2_ptr = ((parameter_ptr as u64 + (mem::size_of::<u64>() as u64 * 7)).to_le_bytes()).to_vec();
     let mut arg3_ptr = ((parameter_ptr as u64 + (mem::size_of::<u64>() as u64 * 8)).to_le_bytes()).to_vec();
     let mut end_ptr = ((0 as u64).to_le_bytes()).to_vec();
 
-    let mut arg1_buff = ((code_base as u64).to_le_bytes()).to_vec();
-    let mut arg2_buff = ((DLL_PROCESS_ATTACH as u32).to_le_bytes()).to_vec();
-    let mut arg3_buff = ((0 as u64).to_le_bytes()).to_vec();
+    let mut arg1_buff = (arg1.to_le_bytes()).to_vec();
+    let mut arg2_buff = ((arg2 as u32).to_le_bytes()).to_vec();
+    let mut arg3_buff = ((arg3 as u64).to_le_bytes()).to_vec();
 
     arg0_ptr.append(&mut arg1_ptr);
     arg0_ptr.append(&mut arg2_ptr);
@@ -1136,8 +1203,27 @@ fn execute_tls(nt_ptr: *mut IMAGE_NT_HEADERS, mem_module: *mut MemoryModule)->bo
 
     arg1_buff.append(&mut arg2_buff);
     arg1_buff.append(&mut arg3_buff);
-    println!("parameter_ptr {:#x}", parameter_ptr as u64);
+    let mut arg0_buff = (arg0_func.to_le_bytes()).to_vec();
+    arg0_buff.append(&mut arg1_buff);
+    arg0_ptr.append(&mut arg0_buff);
+    let _status = unsafe { _default_memwrite(
+        proc_handle,
+        parameter_ptr as PVOID,
+        arg0_ptr.as_ptr() as LPCVOID,
+        arg0_ptr.len(),
+        &mut bytes_written,
+    )};
+    _status
+}
 
+fn execute_tls(nt_ptr: *mut IMAGE_NT_HEADERS, mem_module: *mut MemoryModule, 
+    tls_wrapper_func: u64, parameter_ptr: u64)->bool {
+    let code_base = unsafe {(*mem_module).code_base};
+    let proc_handle = unsafe { (*mem_module).h_prochandle };
+    let virtual_alloc = unsafe {(*mem_module).functions._virtual_alloc};
+    let mut bytes_written: usize = 0;
+    let mut bytes_read: usize = 0;
+    println!("tls_wrapper_func {:#x}", tls_wrapper_func as u64);
     let directory = get_header_dictionary(
         nt_ptr, IMAGE_DIRECTORY_ENTRY_TLS as usize);
     unsafe {
@@ -1177,22 +1263,25 @@ fn execute_tls(nt_ptr: *mut IMAGE_NT_HEADERS, mem_module: *mut MemoryModule)->bo
                     buf.as_mut_ptr() as LPVOID,
                     buf_size,
                     &mut bytes_read)};
-                let mut temp = std::ptr::read(buf.as_mut_ptr() as *const _);
+                let mut temp = std::ptr::read(buf.as_mut_ptr() as *const u64);
                 let mut tls_callback_func_ptr = &mut temp;
+
+                // TODO fix up this shit 
                 println!("tls_callback_func_ptr {:#x}", (*tls_callback_func_ptr) as u64);
                 if (*tls_callback_func_ptr) as u64 == 0 {
                     break;
                 }
-                let mut arg0_buff = (((*tls_callback_func_ptr) as u64).to_le_bytes()).to_vec();
-                arg0_buff.append(&mut arg1_buff);
-                arg0_ptr.append(&mut arg0_buff);
-                _status = unsafe {_default_memwrite(
-                    proc_handle,
-                    parameter_ptr,
-                    arg0_ptr.as_ptr() as LPCVOID,
-                    arg0_ptr.len(),
-                    &mut bytes_written,
-                )};
+                let _status = setup_wrapper_params(
+                    mem_module, 
+                    parameter_ptr, 
+                    (*tls_callback_func_ptr) as u64, 
+                    code_base as u64, 
+                    DLL_PROCESS_ATTACH as u64, 
+                    0);
+                
+                println!("parameter_ptr {:#x}", parameter_ptr as u64);
+
+                
                 let remote_thread = CreateRemoteThread(
                     proc_handle, 
                     std::ptr::null_mut(), 
@@ -1202,7 +1291,7 @@ fn execute_tls(nt_ptr: *mut IMAGE_NT_HEADERS, mem_module: *mut MemoryModule)->bo
                     0, 
                     std::ptr::null_mut());
                 if remote_thread == 0 as HANDLE {
-                    println!("remote_thread failed");
+                    println!("TLS remote_thread failed");
                     return false;
                 }
                 WaitForSingleObject(remote_thread, INFINITE);
@@ -1214,7 +1303,6 @@ fn execute_tls(nt_ptr: *mut IMAGE_NT_HEADERS, mem_module: *mut MemoryModule)->bo
     true
 }
 
-// TODO: Get debug privileges
 fn memory_loadlibrary_ex(
     data: PVOID, 
     size: u32,
@@ -1222,7 +1310,10 @@ fn memory_loadlibrary_ex(
     get_proc_address: PCustomGetProcAddress,
     free_libary: PFreeLibary,
     virtual_alloc: PVirtualAllocEx,
-    virtal_free: PVirtualFreeEx)->u32{
+    virtal_free: PVirtualFreeEx,
+    phandle: HANDLE)->u32{
+
+    let mut target_handle: HANDLE = phandle;
 
     // Check Size
     if check_size(size as u64, mem::size_of::<IMAGE_DOS_HEADER>() as u64){
@@ -1272,9 +1363,11 @@ fn memory_loadlibrary_ex(
     }
     
     // reserve memory for image of library
-    let self_handle = unsafe { GetCurrentProcess() }; // TODO: temporary, remove for remote process
+    if target_handle == NULL {
+        target_handle = unsafe { GetCurrentProcess() };
+    }
     let mut code = unsafe { virtual_alloc(
-        self_handle,
+        target_handle,
         //optional_header.ImageBase as PVOID,
         NULL,
         aligned_image_size as usize,
@@ -1285,7 +1378,7 @@ fn memory_loadlibrary_ex(
     if code == NULL{
         // try to allocate memory at arbitrary position
         code = unsafe { virtual_alloc(
-            self_handle,
+            target_handle,
             NULL,
             aligned_image_size as usize,
             (MEM_RESERVE | MEM_COMMIT) as u32,
@@ -1308,7 +1401,7 @@ fn memory_loadlibrary_ex(
         };
         blocked_memory.next = Some(Box::new(next));
         code = unsafe { virtual_alloc(
-            self_handle,
+            target_handle,
             NULL,
             aligned_image_size as usize,
             (MEM_RESERVE | MEM_COMMIT) as u32,
@@ -1325,7 +1418,7 @@ fn memory_loadlibrary_ex(
     let mut memory_module = MemoryModule{
         header_base: NULL,
         code_base: code,
-        h_prochandle: self_handle,
+        h_prochandle: target_handle,
         h_module: NULL,
         num_modules: 0,
         initialized: false,
@@ -1349,7 +1442,7 @@ fn memory_loadlibrary_ex(
         return 0;
     }
     let header_mem = unsafe { virtual_alloc(
-        self_handle,
+        target_handle,
         code,
         optional_header.SizeOfHeaders as usize,
         MEM_COMMIT as u32,
@@ -1366,12 +1459,13 @@ fn memory_loadlibrary_ex(
     // copy PE header to code
     let mut bytes_written: usize = 0;
     let _status = unsafe {_default_memwrite(
-        self_handle,
+        target_handle,
         code,
         data as LPCVOID,
         optional_header.SizeOfHeaders as usize,
         &mut bytes_written,
     )};
+
     // Offset to IMAGE_NT_HEADERS
     memory_module.header_base = (header_mem as u64 + nt_hdr_offset as u64) as LPVOID;
 
@@ -1381,6 +1475,8 @@ fn memory_loadlibrary_ex(
         println!("failed to copy sections!");
         return 0;
     }
+
+    
     // adjust base address of imported data
     let location_delta: ptrdiff_t = (new_image_base - old_image_base) as ptrdiff_t;
     if location_delta != 0 {
@@ -1401,25 +1497,44 @@ fn memory_loadlibrary_ex(
         println!("finalize_sections failed!");
         return 0;
     }
+
+    let (shellcode_func_wrapper, parameter_ptr) = create_func_wrapper(&mut memory_module);
     // TLS callbacks are executed BEFORE the main loading
-    if !execute_tls(nt_ptr, &mut memory_module) {
+    if !execute_tls(nt_ptr, &mut memory_module, shellcode_func_wrapper, parameter_ptr) {
         return 0;
     }
 
-    
-    
     // get entry point of loaded library
     if optional_header.AddressOfEntryPoint != 0 {
         let dll_entry_ptr = memory_module.code_base as u64 + optional_header.AddressOfEntryPoint as u64;
         if memory_module.is_dll {
             println!("Is DLL");
             println!("dll_entry_ptr {:#x}", dll_entry_ptr);
-            let dll_entry_func = unsafe { example!(dll_entry_ptr, DllEntryProc)};
-            
-            unsafe { Sleep(0x6000) };
-            let result = unsafe { dll_entry_func(memory_module.code_base as HINSTANCE , DLL_PROCESS_ATTACH, NULL) };
-            if result == 0 as BOOL {
-                println!("dll entry failed!");
+            unsafe {
+                let dll_entry_func = example!(shellcode_func_wrapper, PLoadLibraryA);
+
+                let _status = setup_wrapper_params(
+                    &mut memory_module, 
+                    parameter_ptr, 
+                    dll_entry_ptr, 
+                    memory_module.code_base as u64, 
+                    DLL_PROCESS_ATTACH as u64, 
+                    0);
+                
+                Sleep(0x6000);
+                let remote_thread = CreateRemoteThread(
+                    memory_module.h_prochandle, 
+                    std::ptr::null_mut(), 
+                    0, 
+                    Some(dll_entry_func),
+                    parameter_ptr as PVOID, 
+                    0, 
+                    std::ptr::null_mut());
+                if remote_thread == 0 as HANDLE {
+                    println!("dll_entry_ptr remote_thread failed");
+                    return 0;
+                }
+                WaitForSingleObject(remote_thread, INFINITE);
             }
             memory_module.initialized = true;
         } else {
