@@ -1,0 +1,15 @@
+[package]
+name = "dummy_dll"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+winapi = { version = "0.3.9", features = ["winuser", "minwindef", "libloaderapi", "memoryapi", "consoleapi", "winnt",
+    "tlhelp32", "handleapi", "processthreadsapi", "impl-default", "errhandlingapi", "basetsd", "psapi", "winerror",
+    "shlobj", "knownfolders", "winbase", "combaseapi", "wtypesbase", "shobjidl_core", "objidl", "sysinfoapi"] }
+user32-sys = "0.2.0"
