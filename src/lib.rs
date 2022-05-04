@@ -1,5 +1,6 @@
-// cargo build --release --target x86_64-pc-windows-gnu --lib 
+// cargo build --release --target x86_64-pc-windows-gnu
 // sudo apt-get install gcc-mingw-w64-x86-64
+// rustup target add x86_64-pc-windows-gnu
 // This is a lightweight port of https://github.com/fancycode/MemoryModule
 // TODO: Modules should strive to be below 500 lines
 
