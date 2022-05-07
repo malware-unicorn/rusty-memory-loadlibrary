@@ -4,6 +4,7 @@
 // This is a lightweight port of https://github.com/fancycode/MemoryModule
 // TODO: Modules should strive to be below 500 lines
 
+// TOOD: [DATE: 5/4] Refactor the error handling
 // TODO: [DATE: 4/15] Fix bullshit remote getprocaddress
 // TODO: [FUTURE] Unhook NTDLL APIs using the PEB
 extern crate winapi;
@@ -28,6 +29,7 @@ use winapi::shared::minwindef::{
     LPCVOID,
     ULONG,
     WORD,
+    LPDWORD,
 };
 use winapi::um::winnt::{
     LPCSTR,
@@ -38,6 +40,7 @@ use winapi::um::winnt::{
     MEM_RESERVE,
     MEM_COMMIT,
     PAGE_READWRITE,
+    LPSTR,
 };
 use winapi::shared::basetsd::{SIZE_T,PSIZE_T};
 use winapi::shared::ntdef::{
@@ -121,6 +124,12 @@ use ntapi::ntldr::{LDR_DATA_TABLE_ENTRY,LDR_DATA_TABLE_ENTRY_u1};
 #[allow(unused_imports)]
 use std::ffi::{ OsStr, OsString};
 use std::os::windows::prelude::OsStringExt;
+use winapi::um::psapi::{
+    GetModuleInformation, 
+    MODULEINFO,
+    EnumProcessModulesEx,
+    LIST_MODULES_ALL,
+    GetModuleBaseNameA};
 
 // Convert address into function
 macro_rules! example {
@@ -410,9 +419,260 @@ unsafe extern "system" fn _default_getprocaddress(h_module: HMODULE, lp_proc_nam
         lp_proc_name);
 }
 
-// TODO: https://www.codeproject.com/Tips/139349/Getting-the-address-of-a-function-in-a-DLL-loaded
-unsafe extern "system" fn _remote_getprocaddress(h_module: HMODULE, lp_proc_name: LPCSTR) -> FARPROC {
-    return 0
+
+unsafe fn remote_struct_read<T>(proc_handle: HANDLE, ptr_address: u64)-> Vec<u8>{
+    let mut bytes_read: usize = 0;
+    let mut buf = vec![0u8; mem::size_of::<T>()];
+    let mut result = _default_memread(
+        proc_handle,
+        ptr_address as LPCVOID,
+        buf.as_mut_ptr() as LPVOID,
+        mem::size_of::<T>(),
+        &mut bytes_read);
+    buf
+}
+
+// ref: https://www.codeproject.com/Tips/139349/Getting-the-address-of-a-function-in-a-DLL-loaded
+unsafe extern "system" fn _remote_getmodulehandle( mem_module: *mut MemoryModule, lp_filename: &str) -> HMODULE {
+    let proc_handle = (*mem_module).h_prochandle;
+    let mut h_module: HMODULE;
+    let mut module_array_size: usize = 100;
+    let mut h_mods: Vec<HMODULE> = vec![0 as HMODULE; module_array_size];
+    let mut num_modules: u32 = 0;
+    // get all the handles EnumProcessModulesEx
+    let mut _result = EnumProcessModulesEx(
+        proc_handle, 
+        h_mods.as_mut_ptr(), 
+        (module_array_size * mem::size_of::<HMODULE>()) as DWORD, 
+        &mut num_modules as LPDWORD, 
+        LIST_MODULES_ALL);
+    
+    num_modules = num_modules / mem::size_of::<HMODULE>() as u32;
+    println!("num_modules {:x?}", num_modules);
+
+    // check if allocated enough
+    if num_modules as usize > module_array_size{
+        // Call again
+        h_mods = Vec::<HMODULE>::with_capacity(num_modules as usize);
+        module_array_size = num_modules as usize;
+        _result = EnumProcessModulesEx(
+            proc_handle, 
+            h_mods.as_mut_ptr(), 
+            (module_array_size * mem::size_of::<HMODULE>()) as DWORD, 
+            &mut num_modules as LPDWORD, 
+            LIST_MODULES_ALL);
+        num_modules = num_modules / mem::size_of::<HMODULE>() as u32;
+    }
+    // iterate and GetModuleBaseName
+    let mut i: usize = 0;
+    while i < num_modules as usize {
+        let mut name_buf = vec![0; MAX_DLL_NAME];
+        let _result_base = GetModuleBaseNameA(
+            proc_handle,
+            h_mods[i] as HMODULE,
+            name_buf.as_mut_ptr() as LPSTR,
+            MAX_DLL_NAME as DWORD);
+        let name_cstring = buff_to_str(name_buf);
+        let name_str = name_cstring.as_c_str().to_str().unwrap();
+        println!("GetModuleBaseNameA {}", name_str);
+        if lp_filename.eq_ignore_ascii_case(name_str){
+            return h_mods[i];
+        }
+        i = i + 1;
+    }
+
+    0 as HMODULE
+}
+
+// ref: https://www.codeproject.com/Tips/139349/Getting-the-address-of-a-function-in-a-DLL-loaded
+// 64bit only
+unsafe extern "system" fn _remote_getprocaddress(
+    mem_module: *mut MemoryModule, 
+    h_module: HMODULE, 
+    lp_proc_name: &str, 
+    ordinal: u32, 
+    use_ordinal: bool) -> u64 {
+    // check for null handle
+    let proc_handle = (*mem_module).h_prochandle;
+    let mut remote_module_info: MODULEINFO = mem::zeroed();
+    let mod_size =  mem::size_of::<MODULEINFO>();
+    let mut remote_base_va: LPVOID;
+    let mut export_dir: IMAGE_DATA_DIRECTORY = mem::zeroed();
+    let mut export_table: IMAGE_EXPORT_DIRECTORY = mem::zeroed();
+    let mut proc_address: u64 = 0;
+
+    // get the base address with GetModuleInformation
+    match GetModuleInformation( proc_handle, h_module,
+        &mut remote_module_info,
+        mod_size as u32) {
+            FALSE =>return 0,
+            _ =>(),
+    }
+
+    println!("GetModuleInformation {:x?}", lp_proc_name); 
+    remote_base_va = remote_module_info.lpBaseOfDll;
+
+    // Read the DOS header and check magic number
+    let dos_size = mem::size_of::<IMAGE_DOS_HEADER>();
+    let mut buf = vec![0u8; dos_size as usize];
+    let mut bytes_read: usize = 0;
+    let mut _result = unsafe {_default_memread(
+        proc_handle,
+        remote_base_va,
+        buf.as_mut_ptr() as LPVOID,
+        dos_size,
+        &mut bytes_read)};
+    // TODO: handle result
+    println!("IMAGE_DOS_HEADER {:x?}", _result); 
+
+    // TODO: consider read_unaligned
+    let dos_header: IMAGE_DOS_HEADER = std::ptr::read(buf.as_mut_ptr() as *const _);
+    //let dos_header: &mut IMAGE_DOS_HEADER = &mut temp;
+    // Read and check the NT signature
+    if DOS_SIGNATURE != dos_header.e_magic {
+        println!("DOS_SIGNATURE failed!");
+        return 0;
+    }
+    // Read the main header
+    let nt_hdr_offset = remote_base_va as u64 + dos_header.e_lfanew as u64;
+    let mut nt_buf = remote_struct_read::<IMAGE_NT_HEADERS>(proc_handle, nt_hdr_offset);
+    let nt_header: IMAGE_NT_HEADERS = std::ptr::read(nt_buf.as_mut_ptr() as *const _);
+    if PE_SIGNATURE != nt_header.Signature {
+        println!("PE_SIGNATURE failed!");
+        return 0;
+    }
+    println!("IMAGE_NT_HEADERS {:x?}", _result); 
+    // save relative adddress
+    if nt_header.OptionalHeader.NumberOfRvaAndSizes >= 1 {
+        export_dir.VirtualAddress = nt_header.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT as usize].VirtualAddress;
+        export_dir.Size = nt_header.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT as usize].Size;
+    }
+
+    println!("DataDirectory {:x?}",  nt_header.OptionalHeader.DataDirectory.len()); 
+    // Read the main export table
+    let exp_va = remote_base_va as u64 + export_dir.VirtualAddress as u64;
+    let mut exp_buf = remote_struct_read::<IMAGE_EXPORT_DIRECTORY>(proc_handle, exp_va);
+    export_table = std::ptr::read(exp_buf.as_mut_ptr() as *const _);
+    //println!("name buf {:x?}", export_table);
+    // Save the absolute address of the table
+    let export_func_table_ptr = remote_base_va as u64 + export_table.AddressOfFunctions as u64;
+    let export_name_table_ptr = remote_base_va as u64 + export_table.AddressOfNames as u64;
+    let export_ordinal_table_ptr = remote_base_va as u64 + export_table.AddressOfNameOrdinals as u64;
+
+    println!("export_func_table_ptr {:#x}", export_func_table_ptr);
+    println!("export_name_table_ptr {:#x}", export_name_table_ptr);
+    println!("export_ordinal_table_ptr {:#x}", export_ordinal_table_ptr);
+    // Allocate memory to copy the tables
+
+    let mut func_table_buf = vec![0u32; export_table.NumberOfFunctions as usize];
+    let mut func_name_buf = vec![0u32; export_table.NumberOfNames as usize];
+    let mut func_oridinal_buf = vec![0u16; export_table.NumberOfNames as usize];
+    _result = _default_memread(
+        proc_handle,
+        export_func_table_ptr as LPCVOID,
+        func_table_buf.as_mut_ptr() as LPVOID,
+        export_table.NumberOfFunctions as usize * mem::size_of::<u32>(),
+        &mut bytes_read);
+    _result = _default_memread(
+        proc_handle,
+        export_name_table_ptr as LPCVOID,
+        func_name_buf.as_mut_ptr() as LPVOID,
+        export_table.NumberOfNames as usize * mem::size_of::<u32>(),
+        &mut bytes_read);
+    _result = _default_memread(
+        proc_handle,
+        export_ordinal_table_ptr as LPCVOID,
+        func_oridinal_buf.as_mut_ptr() as LPVOID,
+        export_table.NumberOfNames as usize * mem::size_of::<u16>(),
+        &mut bytes_read);
+    
+    if use_ordinal {
+        // TODO
+    }
+
+    let mut i = 0;
+    let mut func_found: bool = false;
+    while i < func_name_buf.len() {
+        //println!("func_table_buf {} {:#x}", i, func_name_buf[i]);
+
+        let mut funcname_buf = vec![0; _MAX_DLL_FUNC_NAME];
+        let mut funcname_bytes_read: usize = 0;
+        let func_name_ptr = remote_base_va as u64 + func_name_buf[i] as u64;
+        _default_memread(
+            proc_handle,
+            func_name_ptr as LPCVOID,
+            funcname_buf.as_mut_ptr() as LPVOID,
+            _MAX_DLL_FUNC_NAME,
+            &mut funcname_bytes_read);
+        
+        //println!("bytes read {:#?}", funcname_buf);
+        let funcname_cstring = buff_to_str(funcname_buf);
+        let funcname_str = funcname_cstring.as_c_str().to_str().unwrap();
+        if lp_proc_name.eq(funcname_str) {
+            println!("func {}", funcname_str);
+            func_found = true;
+            break;
+        }
+
+        // if forwarder
+        if func_table_buf[func_oridinal_buf[i] as usize] as u64 >= export_dir.VirtualAddress as u64 && 
+            func_table_buf[func_oridinal_buf[i] as usize] as u64 <= (export_dir.VirtualAddress + export_dir.Size) as u64 {
+            println!("func {}", funcname_str);        
+        } else { // not forwarder
+
+        }
+        i = i + 1;
+    }
+    if !func_found {
+        return 0;
+    }
+    // Check if the function is forwarded
+    if func_table_buf[func_oridinal_buf[i] as usize] as u64 >= export_dir.VirtualAddress as u64 && 
+        func_table_buf[func_oridinal_buf[i] as usize] as u64 <= (export_dir.VirtualAddress + export_dir.Size) as u64 {
+        //println!("func {}", funcname_str);
+        // Get the forwarder string
+        let mut forwname_buf = vec![0; _MAX_DLL_FUNC_NAME];
+        let mut forwname_bytes_read: usize = 0;
+        let forwname_ptr = remote_base_va as u64 + func_table_buf[func_oridinal_buf[i] as usize] as u64;
+        _default_memread(
+            proc_handle,
+            forwname_ptr as LPCVOID,
+            forwname_buf.as_mut_ptr() as LPVOID,
+            _MAX_DLL_FUNC_NAME,
+            &mut forwname_bytes_read);
+        let forwname_cstring = buff_to_str(forwname_buf);
+        let forwname_str = forwname_cstring.as_c_str().to_str().unwrap();
+        // Split string at dot
+        let forwarder_str_parts: Vec<&str> = forwname_str.splitn(2, '.').collect();
+        println!("forwname_str {} {}", forwarder_str_parts[0], forwarder_str_parts[1]);
+        let forwarder_module_name = forwarder_str_parts[0];
+        let forwarder_func_name = forwarder_str_parts[1];
+        
+        // Get remote module handle
+        let remote_module = _remote_getmodulehandle( mem_module, forwarder_module_name);
+
+        // exported by name or ordinal
+        if forwarder_func_name.chars().nth(0) == Some('#') {
+            let mut real_odrinal = 0;
+            // strip #
+            let ordinal_name = forwarder_func_name.strip_prefix('#').unwrap_or(forwarder_func_name);
+            // atoi
+            let oridinal_num: u32 = ordinal_name.parse().unwrap_or(0);
+            // recursive _remote_getprocaddress
+            proc_address = _remote_getprocaddress(mem_module, remote_module, "", oridinal_num, true);
+
+        } else { // exported by name
+            proc_address  = _remote_getprocaddress(mem_module, remote_module, forwarder_func_name, 0, false);
+        }
+        return proc_address;            
+    } else { // not forwarded
+        proc_address = remote_base_va as u64 + func_table_buf[func_oridinal_buf[i] as usize] as u64;
+        return proc_address;
+    }
+     // If Name
+
+
+    0
 }
 
 
@@ -940,17 +1200,19 @@ fn build_import_table(
                     let funcname_str = funcname_cstring.as_c_str().to_str().unwrap();
 
                     // TODO: https://www.codeproject.com/Tips/139349/Getting-the-address-of-a-function-in-a-DLL-loaded
-                    let proc_addr = get_proc_addr(dll_module, funcname_cstring.as_ptr() as LPCSTR);
+                    // TODO figure out remote
+                    let mut proc_addr = get_proc_addr(dll_module, funcname_cstring.as_ptr() as LPCSTR) as u64;
                     if proc_addr as u64 == 0 {
+                        proc_addr = _remote_getprocaddress(mem_module, dll_module, funcname_str, 0, false);
                         println!("name_cstring {:x?}", funcname_cstring);
                         println!("name buf {}", funcname_str);
-                        println!("proc_addr {:#x}", proc_addr as u64);
+                        println!("proc_addr {:#x}", proc_addr);
                         println!("_func_ref {:#x}", _func_ref as u64);
                     }
                     
                     // write thunk_ref
                     let mut bytes_written = 0;
-                    let func_ref_value = ((proc_addr as u64).to_le_bytes()).to_vec();
+                    let func_ref_value = (proc_addr.to_le_bytes()).to_vec();
                     _status =_default_memwrite(
                         proc_handle,
                         _func_ref as LPVOID,
@@ -958,7 +1220,7 @@ fn build_import_table(
                         mem::size_of::<u64>(),
                         &mut bytes_written,
                     );
-                    _func_ref_value_ptr = proc_addr as u64;
+                    _func_ref_value_ptr = proc_addr;
                     //println!("_func_ref_value_ptr {:#x}", _func_ref_value_ptr as u64);
                 }
                 if _func_ref_value_ptr == 0 {

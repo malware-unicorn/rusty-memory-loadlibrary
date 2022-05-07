@@ -64,6 +64,16 @@ extern "stdcall" fn DllMain(
                 }
             }
             // PUT FUNCTION HERE $function();
+            unsafe {
+                let lp_text = CString::new("DUMMY! This is CobaltStrike! AHHH").unwrap();
+                let lp_caption = CString::new("MessageBox Example").unwrap();
+                MessageBoxA(
+                    std::ptr::null_mut(),
+                    lp_text.as_ptr(),
+                    lp_caption.as_ptr(),
+                    MB_OK | MB_ICONINFORMATION
+                );
+            }
             if cfg!(debug_assertions) {
                 unsafe {
                     FreeConsole();
