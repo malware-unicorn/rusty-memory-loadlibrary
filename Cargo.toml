@@ -3,11 +3,9 @@ name = "rusty_memory_loadlibrary"
 version = "0.1.0"
 edition = "2021"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [dependencies]
 winapi = { version = "0.3.9", features = ["libloaderapi","consoleapi", "wincon", 
-    "minwindef","winnt", "memoryapi", "sysinfoapi", "processthreadsapi","memoryapi", "vcruntime",
-    "synchapi", "winbase", "tlhelp32", "psapi"] }
+    "minwindef","winnt", "memoryapi", "sysinfoapi", "processthreadsapi",
+    "memoryapi", "vcruntime","synchapi", "winbase", "tlhelp32", "psapi"] }
 ntapi = "0.3.4"
 field-offset = "0.3.4"

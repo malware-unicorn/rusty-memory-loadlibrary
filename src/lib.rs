@@ -5,133 +5,53 @@
 // TODO: Modules should strive to be below 500 lines
 
 
-// TODO: [DATE: 5/6] test remotegetprocaddress, refactor functions
+// TODO: [DATE: 5/7] refactor functions
 // TOOD: [DATE: 5/4] Refactor the error handling
-
 // TODO: [FUTURE] Unhook NTDLL APIs using the PEB
 extern crate winapi;
 
 use std::mem;
-use winapi::um::libloaderapi::{
-    DisableThreadLibraryCalls,
-    LoadLibraryA,
-    GetProcAddress,
-    FreeLibrary,
-};
+use winapi::um::libloaderapi::{DisableThreadLibraryCalls,LoadLibraryA,
+    GetProcAddress,FreeLibrary};
 use winapi::um::consoleapi::AllocConsole;
 use winapi::um::wincon::FreeConsole;
-use winapi::shared::minwindef::{
-    BOOL,
-    TRUE,
-    DWORD,
-    HINSTANCE, 
-    FARPROC,
-    HMODULE,
-    LPVOID,
-    LPCVOID,
-    ULONG,
-    WORD,
-    LPDWORD,
-};
+use winapi::shared::minwindef::{BOOL,TRUE,DWORD,HINSTANCE, FARPROC,HMODULE,
+    LPVOID,LPCVOID,ULONG,WORD,LPDWORD};
 use winapi::um::winnt::{
-    LPCSTR,
-    DLL_PROCESS_ATTACH,
-    PVOID,
-    HANDLE,
-    ACCESS_MASK,
-    MEM_RESERVE,
-    MEM_COMMIT,
-    PAGE_READWRITE,
-    LPSTR,
-};
+    LPCSTR,DLL_PROCESS_ATTACH,PVOID,HANDLE,ACCESS_MASK,MEM_RESERVE,MEM_COMMIT,
+    PAGE_READWRITE,LPSTR};
 use winapi::shared::basetsd::{SIZE_T,PSIZE_T};
-use winapi::shared::ntdef::{
-    POBJECT_ATTRIBUTES,
-    NTSTATUS,
-    PHANDLE,
-    NULL,
-};
+use winapi::shared::ntdef::{POBJECT_ATTRIBUTES,NTSTATUS,PHANDLE,NULL};
 use ntapi::ntapi_base::PCLIENT_ID;
-use ntapi::ntpsapi::PPS_ATTRIBUTE_LIST;
-use winapi::um::memoryapi::{
-    VirtualAllocEx,
-    VirtualFreeEx
-};
-#[allow(unused_imports)]
-use winapi::um::winnt::{
-    IMAGE_DOS_HEADER, 
-    IMAGE_NT_HEADERS, 
-    IMAGE_OPTIONAL_HEADER, 
-    IMAGE_DATA_DIRECTORY, 
-    IMAGE_EXPORT_DIRECTORY,
-    IMAGE_DIRECTORY_ENTRY_EXPORT,
-    IMAGE_FILE_MACHINE_AMD64,
-    IMAGE_SECTION_HEADER,
-    IMAGE_FILE_DLL,
-    IMAGE_FILE_HEADER,
-    IMAGE_BASE_RELOCATION,
-    IMAGE_REL_BASED_ABSOLUTE,
-    IMAGE_REL_BASED_HIGHLOW,
-    IMAGE_REL_BASED_DIR64,
-    IMAGE_DIRECTORY_ENTRY_BASERELOC,
-    IMAGE_DIRECTORY_ENTRY_TLS,
-    IMAGE_DIRECTORY_ENTRY_IMPORT,
-    IMAGE_IMPORT_DESCRIPTOR,
-    IMAGE_SNAP_BY_ORDINAL,
-    IMAGE_ORDINAL,
-    IMAGE_SCN_CNT_INITIALIZED_DATA,
-    IMAGE_SCN_CNT_UNINITIALIZED_DATA,
-    IMAGE_SCN_MEM_DISCARDABLE,
-    PAGE_NOACCESS, PAGE_WRITECOPY,
-    PAGE_READONLY,
-    PAGE_EXECUTE, PAGE_EXECUTE_WRITECOPY,
-    PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
-    IMAGE_SCN_MEM_READ,
-    IMAGE_SCN_MEM_WRITE,
-    IMAGE_SCN_MEM_EXECUTE,
-    IMAGE_SCN_MEM_NOT_CACHED,
-    PAGE_NOCACHE,
-    PIMAGE_TLS_CALLBACK,
-    IMAGE_TLS_DIRECTORY,
-};
-use winapi::um::synchapi::{
-    Sleep,
-    WaitForSingleObject};
+use winapi::um::memoryapi::{VirtualAllocEx,VirtualFreeEx};
+use winapi::um::winnt::{IMAGE_DOS_HEADER,IMAGE_NT_HEADERS,IMAGE_DATA_DIRECTORY, 
+    IMAGE_EXPORT_DIRECTORY,IMAGE_DIRECTORY_ENTRY_EXPORT,IMAGE_FILE_MACHINE_AMD64,
+    IMAGE_SECTION_HEADER,IMAGE_FILE_DLL,IMAGE_FILE_HEADER,
+    IMAGE_BASE_RELOCATION,IMAGE_REL_BASED_HIGHLOW,IMAGE_REL_BASED_DIR64,
+    IMAGE_DIRECTORY_ENTRY_BASERELOC,IMAGE_DIRECTORY_ENTRY_TLS,
+    IMAGE_DIRECTORY_ENTRY_IMPORT,IMAGE_IMPORT_DESCRIPTOR,IMAGE_SNAP_BY_ORDINAL,
+    IMAGE_ORDINAL,IMAGE_SCN_CNT_INITIALIZED_DATA,IMAGE_SCN_CNT_UNINITIALIZED_DATA,
+    IMAGE_SCN_MEM_DISCARDABLE,PAGE_NOACCESS, PAGE_WRITECOPY,PAGE_READONLY,
+    PAGE_EXECUTE, PAGE_EXECUTE_WRITECOPY,PAGE_EXECUTE_READ, 
+    PAGE_EXECUTE_READWRITE,IMAGE_SCN_MEM_READ,IMAGE_SCN_MEM_WRITE,
+    IMAGE_SCN_MEM_EXECUTE,IMAGE_SCN_MEM_NOT_CACHED,PAGE_NOCACHE,
+    IMAGE_TLS_DIRECTORY,MEM_RELEASE};
+use winapi::um::synchapi::{Sleep,WaitForSingleObject};
 use winapi::um::sysinfoapi::{GetNativeSystemInfo, SYSTEM_INFO};
 use field_offset::offset_of;
 use winapi::ctypes::c_void;
-use winapi::um::processthreadsapi::{
-    GetCurrentProcess,
-    CreateRemoteThread};
-use winapi::um::memoryapi::{
-    WriteProcessMemory,
-    ReadProcessMemory,
-    VirtualProtectEx};
+use winapi::um::processthreadsapi::{GetCurrentProcess,CreateRemoteThread};
+use winapi::um::memoryapi::{WriteProcessMemory,ReadProcessMemory,VirtualProtectEx};
 use winapi::vc::vcruntime::ptrdiff_t;
-use winapi::um::winbase::{
-    INFINITE};
-use std::ffi::CString;
-#[allow(unused_imports)]
-use std::ffi::CStr;
-#[allow(unused_imports)]
-use ntapi::ntpsapi::{
-    NtQueryInformationProcess,
-    PROCESS_BASIC_INFORMATION, 
-    PPROCESS_BASIC_INFORMATION,
-    ProcessBasicInformation};
+use winapi::um::winbase::INFINITE;
+use std::ffi::{CString, OsString};
+use ntapi::ntpsapi::{NtQueryInformationProcess,PROCESS_BASIC_INFORMATION, 
+    ProcessBasicInformation,PEB_LDR_DATA,PPS_ATTRIBUTE_LIST};
 use ntapi::ntpebteb::PEB;
-use ntapi::ntpsapi::PEB_LDR_DATA;
-#[allow(unused_imports)]
-use ntapi::ntldr::{LDR_DATA_TABLE_ENTRY,LDR_DATA_TABLE_ENTRY_u1};
-#[allow(unused_imports)]
-use std::ffi::{ OsStr, OsString};
+use ntapi::ntldr::{LDR_DATA_TABLE_ENTRY};
 use std::os::windows::prelude::OsStringExt;
-use winapi::um::psapi::{
-    GetModuleInformation, 
-    MODULEINFO,
-    EnumProcessModulesEx,
-    LIST_MODULES_ALL,
-    GetModuleBaseNameA};
+use winapi::um::psapi::{GetModuleInformation, MODULEINFO,
+    EnumProcessModulesEx,LIST_MODULES_ALL,GetModuleBaseNameA};
 
 // Convert address into function
 macro_rules! example {
@@ -159,18 +79,18 @@ type PVirtualFreeEx = unsafe extern "system" fn (
     lp_address: LPVOID, 
     dw_size: SIZE_T, 
     dw_free_type: DWORD) -> BOOL;
-type POpenProcess = unsafe extern "system" fn (
+type _POpenProcess = unsafe extern "system" fn (
     ProcessHandle: PHANDLE, 
     DesiredAccess: ACCESS_MASK, 
     ObjectAttributes: POBJECT_ATTRIBUTES, 
     ClientId: PCLIENT_ID) -> NTSTATUS;
-type PNtWriteVirtualMemory = unsafe extern "system" fn (
+type _PNtWriteVirtualMemory = unsafe extern "system" fn (
     ProcessHandle: HANDLE, 
     BaseAddress: PVOID, 
     Buffer: PVOID, 
     BufferSize: SIZE_T, 
     NumberOfBytesWritten: PSIZE_T) -> NTSTATUS;
-type PNtCreateThreadEx = unsafe extern "system" fn (
+type _PNtCreateThreadEx = unsafe extern "system" fn (
     ThreadHandle: PHANDLE, 
     DesiredAccess: ACCESS_MASK, 
     ObjectAttributes: POBJECT_ATTRIBUTES, 
@@ -183,7 +103,7 @@ type PNtCreateThreadEx = unsafe extern "system" fn (
     MaximumStackSize: SIZE_T, 
     AttributeList: PPS_ATTRIBUTE_LIST) -> NTSTATUS;
 type ExeEntryProc = unsafe extern "system" fn (c_void) -> u32;
-type DllEntryProc = unsafe extern "system" fn (h_inst_dll: HINSTANCE , fdw_reason: DWORD , lp_reserved: LPVOID) -> BOOL;
+type _DllEntryProc = unsafe extern "system" fn (h_inst_dll: HINSTANCE , fdw_reason: DWORD , lp_reserved: LPVOID) -> BOOL;
 
 struct FunctionMap {
     //openprocess: POpenProcess,
@@ -198,28 +118,28 @@ struct FunctionMap {
 
 struct PointerList {
     next: Option<Box<PointerList>>,
-    address: *mut c_void,
+    _address: *mut c_void,
 }
 
 struct ExportNameEntry {
-    name: LPCSTR,
-    idx: WORD,
+    _name: LPCSTR,
+    _idx: WORD,
 }
 
-struct MemoryModule {
+pub struct MemoryModule {
     header_base: LPVOID,
     code_base: LPVOID,
     h_prochandle: HANDLE,
-    h_module: PVOID,
-    num_modules: u32,
+    _h_module: PVOID,
+    _num_modules: u32,
     initialized: bool,
     is_dll: bool,
     is_relocated: bool,
     functions: FunctionMap,
-    export_table: Vec<ExportNameEntry>,
+    _export_table: Vec<ExportNameEntry>,
     entry_point: Option<ExeEntryProc>,
     page_size: DWORD,
-    blocked_memory: Option<PointerList>,
+    _blocked_memory: Option<PointerList>,
 }
 
 struct SectionFinalizedData {
@@ -247,7 +167,8 @@ const PROTECTION_FLAGS: [[[u32; 2]; 2]; 2] = [
     ],
 ];
 
-fn unhook_ntdll()->u32 {
+// TODO: unhook later
+fn _unhook_ntdll()->u32 {
     0
 }
 
@@ -256,11 +177,12 @@ unsafe extern "system" fn _default_loadlibrary(lp_filename: PVOID) -> u32 {
 }
 
 // Load the library with createremotethread
-unsafe extern "system" fn _remotethread_loadlibrary(
+pub unsafe fn _remotethread_loadlibrary(
     mem_module: *mut MemoryModule, 
     lp_filename: &str) -> HMODULE {
     let proc_handle = (*mem_module).h_prochandle;
     let virtual_alloc = (*mem_module).functions._virtual_alloc;
+    let virtual_free = (*mem_module).functions._virtal_free;
     let get_proc_addr = (*mem_module).functions._get_proc_address;
     
     // Get address to loadlibrary
@@ -317,7 +239,7 @@ unsafe extern "system" fn _remotethread_loadlibrary(
         Sleep(0x1000);
         retry = retry +1;
     }
-    // TODO: Virtual Free
+    virtual_free(proc_handle, memory_address, 0, MEM_RELEASE);
     new_module
 }
 
@@ -327,7 +249,7 @@ unsafe extern "system" fn _remotethread_loadlibrary(
     //   c) pPeb = BasicInfo.PebBaseAddress
     //   d) Reading the PEB -> ReadProcessMemory(hProcess, pbi->PebBaseAddress, &peb, sizeof(peb), &dwBytesRead)
     //   e) Get the exports
-unsafe extern "system" fn _sneaky_loadlibrary(
+pub unsafe fn _sneaky_loadlibrary(
     mem_module: *mut MemoryModule, 
     lp_filename: &str) -> HMODULE {
     let proc_handle = (*mem_module).h_prochandle;
@@ -435,11 +357,11 @@ unsafe fn remote_struct_read<T>(proc_handle: HANDLE, ptr_address: u64)-> Vec<u8>
 }
 
 // ref: https://www.codeproject.com/Tips/139349/Getting-the-address-of-a-function-in-a-DLL-loaded
-unsafe extern "system" fn _remote_getmodulehandle(
+pub unsafe fn _remote_getmodulehandle(
     mem_module: *mut MemoryModule, lp_filename: &str
 ) -> HMODULE {
     let proc_handle = (*mem_module).h_prochandle;
-    let mut h_module: HMODULE;
+    let mut h_module: HMODULE = 0 as HMODULE;
     let mut module_array_size: usize = 100;
     let mut h_mods: Vec<HMODULE> = vec![0 as HMODULE; module_array_size];
     let mut num_modules: u32 = 0;
@@ -480,11 +402,12 @@ unsafe extern "system" fn _remote_getmodulehandle(
         let name_str = name_cstring.as_c_str().to_str().unwrap();
         println!("GetModuleBaseNameA {}", name_str);
         if lp_filename.eq_ignore_ascii_case(name_str){
-            return h_mods[i];
+            h_module = h_mods[i];
+            break;
         }
         i = i + 1;
     }
-    0 as HMODULE
+    h_module
 }
 
 unsafe fn get_forwarded_procaddress(
@@ -496,7 +419,7 @@ unsafe fn get_forwarded_procaddress(
     let mut forwname_buf = vec![0; _MAX_DLL_FUNC_NAME];
     let mut forwname_bytes_read: usize = 0;
     let forwname_ptr = remote_base_vaddr + exp_addr;
-    let mut proc_address: u64 = 0;
+    let proc_address: u64;
 
     match _default_memread(
         proc_handle,
@@ -537,7 +460,7 @@ unsafe fn get_forwarded_procaddress(
 
 // ref: https://www.codeproject.com/Tips/139349/Getting-the-address-of-a-function-in-a-DLL-loaded
 // 64bit only
-unsafe extern "system" fn _remote_getprocaddress(
+pub unsafe fn _remote_getprocaddress(
     mem_module: *mut MemoryModule, 
     h_module: HMODULE, 
     lp_proc_name: &str, 
@@ -547,10 +470,10 @@ unsafe extern "system" fn _remote_getprocaddress(
     let proc_handle = (*mem_module).h_prochandle;
     let mut remote_module_info: MODULEINFO = mem::zeroed();
     let mod_size =  mem::size_of::<MODULEINFO>();
-    let mut remote_base_va: u64;
+    let remote_base_va: u64;
     let mut export_dir: IMAGE_DATA_DIRECTORY = mem::zeroed();
-    let mut export_table: IMAGE_EXPORT_DIRECTORY = mem::zeroed();
-    let mut proc_address: u64 = 0;
+    let export_table: IMAGE_EXPORT_DIRECTORY;
+    let proc_address: u64;
 
     // get the base address with GetModuleInformation
     match GetModuleInformation( proc_handle, h_module,
@@ -685,7 +608,7 @@ unsafe extern "system" fn _remote_getprocaddress(
         proc_address = match get_forwarded_procaddress(
             mem_module, remote_base_va, exp_addr) {
                 Ok(p) => p,
-                Err(e) => 0,
+                Err(_) => 0,
         };
     } else { // not forwarded
         proc_address = remote_base_va + exp_addr as u64;
@@ -745,7 +668,7 @@ unsafe extern "system" fn _default_memread(
     );
 }
 
-pub fn memory_loadlibary(data: PVOID, size: u32)->u32{
+pub fn _memory_loadlibary(data: PVOID, size: u32)->u32{
     return memory_loadlibrary_ex(
         data, 
         size,
@@ -758,7 +681,7 @@ pub fn memory_loadlibary(data: PVOID, size: u32)->u32{
     );
 }
 
-pub fn memory_loadlibary_remote(data: PVOID, size: u32, phandle: HANDLE ) ->u32{
+pub fn _memory_loadlibary_remote(data: PVOID, size: u32, phandle: HANDLE ) ->u32{
     return memory_loadlibrary_ex(
         data, 
         size,
@@ -825,12 +748,10 @@ fn copy_sections(
                 // than page size (allocation above will align to page size).
                 _dest = (code_base as u64 + section.VirtualAddress as u64) as PVOID;
                 unsafe {
-                    let mut physical_addr = (*image_first_section_ptr).Misc.PhysicalAddress_mut();
+                    let physical_addr = (*image_first_section_ptr).Misc.PhysicalAddress_mut();
                     // NOTE: On 64bit systems we truncate to 32bit here but expand
                     // again later when "PhysicalAddress" is used.
-                    (*physical_addr) = (_dest as u64 & 0xffffffff) as DWORD; //TODO: make sure this writes in remote process
-                    println!("section {} physical_addr {:#x}", i, (*physical_addr));
-                    // TODO: figure out how to write this to remote process
+                    (*physical_addr) = (_dest as u64 & 0xffffffff) as DWORD;
                 }
                 // memset(dest, 0, section_size);
                 let null_bytes = vec![0; section_size as usize];
@@ -862,11 +783,10 @@ fn copy_sections(
             }
             _dest = (code_base as u64 + section.VirtualAddress as u64) as PVOID;
             unsafe {
-                let mut physical_addr = (*image_first_section_ptr).Misc.PhysicalAddress_mut();
+                let physical_addr = (*image_first_section_ptr).Misc.PhysicalAddress_mut();
                 // NOTE: On 64bit systems we truncate to 32bit here but expand
                 // again later when "PhysicalAddress" is used.
-                (*physical_addr) = (_dest as u64 & 0xffffffff) as DWORD; //TODO: make sure this writes in remote process
-                println!("section {} physical_addr {:#x}", i, (*physical_addr));
+                (*physical_addr) = (_dest as u64 & 0xffffffff) as DWORD;
             }
             // memcopy
             let mut bytes_written = 0;
@@ -1326,14 +1246,11 @@ fn finalize_sections(
     file_header: *const IMAGE_FILE_HEADER, 
     mem_module: *mut MemoryModule) -> bool {
     // loop through all sections and change access flags
-    let proc_handle = unsafe { (*mem_module).h_prochandle };
-    let code_base = unsafe {(*mem_module).code_base};
-    let virtual_alloc = unsafe {(*mem_module).functions._virtual_alloc};
     let page_size = unsafe {(*mem_module).page_size};
 
     let optional_header = unsafe {(*nt_ptr).OptionalHeader};
     let mut image_first_section_ptr = get_first_section_ptr(nt_ptr, file_header);
-    let mut section: IMAGE_SECTION_HEADER = unsafe { *image_first_section_ptr };
+    let mut section: IMAGE_SECTION_HEADER;
     let mut i = 1;
     let num_sections = unsafe {(*file_header).NumberOfSections};
     let mut _dest: PVOID = 0 as PVOID;
@@ -1343,11 +1260,10 @@ fn finalize_sections(
 
     // "PhysicalAddress" might have been truncated to 32bit above, expand to
     // 64bits again.
-    let imageOffset = optional_header.ImageBase as u64 & 0xffffffff00000000;
-    //let imageOffset = 0;
+    let image_offset = optional_header.ImageBase as u64 & 0xffffffff00000000;
     let physical_addr = unsafe {section.Misc.PhysicalAddress_mut()};
     
-    let section_addr = ((*physical_addr) as u64 | imageOffset) as u64;
+    let section_addr = ((*physical_addr) as u64 | image_offset) as u64;
 
     println!("Section {} {:#x} with offset {:#x}", 0, (*physical_addr), section_addr);
     let mut section_data = SectionFinalizedData{
@@ -1365,7 +1281,7 @@ fn finalize_sections(
         
         let physical_address = unsafe {section.Misc.PhysicalAddress_mut()};
         
-        let section_address = ((*physical_address) as u64 | imageOffset) as u64;
+        let section_address = ((*physical_address) as u64 | image_offset) as u64;
         println!("Section {} {:#x} with offset {:#x}", 0, (*physical_address), section_address);
         let aligned_address = align_address_down(section_address, page_size as u64);
         let section_size = get_real_section_size(nt_ptr, &section);
@@ -1403,7 +1319,6 @@ fn create_func_wrapper(mem_module: *mut MemoryModule) -> (u64, u64) {
     let proc_handle = unsafe { (*mem_module).h_prochandle };
     let virtual_alloc = unsafe {(*mem_module).functions._virtual_alloc};
     let mut bytes_written: usize = 0;
-    let mut bytes_read: usize = 0;
     // func(arg1, arg2, arg3)
     /* Function wrapper using fastcall
         push    rbp
@@ -1501,8 +1416,6 @@ fn execute_tls(nt_ptr: *mut IMAGE_NT_HEADERS, mem_module: *mut MemoryModule,
     tls_wrapper_func: u64, parameter_ptr: u64)->bool {
     let code_base = unsafe {(*mem_module).code_base};
     let proc_handle = unsafe { (*mem_module).h_prochandle };
-    let virtual_alloc = unsafe {(*mem_module).functions._virtual_alloc};
-    let mut bytes_written: usize = 0;
     let mut bytes_read: usize = 0;
     println!("tls_wrapper_func {:#x}", tls_wrapper_func as u64);
     let directory = get_header_dictionary(
@@ -1512,12 +1425,11 @@ fn execute_tls(nt_ptr: *mut IMAGE_NT_HEADERS, mem_module: *mut MemoryModule,
             return true;
         }
     }
-    let mut tls_dir_ptr = unsafe { code_base as u64 + (*directory).VirtualAddress as u64} ;
+    let tls_dir_ptr = unsafe { code_base as u64 + (*directory).VirtualAddress as u64} ;
     unsafe { println!("(*directory).VirtualAddress {:#x}", (*directory).VirtualAddress as u64)};
     println!("tls_dir_ptr {:#x}", tls_dir_ptr as u64);
     let tls_dir_size = mem::size_of::<IMAGE_TLS_DIRECTORY>();
     let mut dir_buf = vec![0; tls_dir_size as usize];
-    let mut bytes_read: usize = 0;
     let _result = unsafe {_default_memread(
         proc_handle,
         tls_dir_ptr as LPCVOID,
@@ -1531,21 +1443,21 @@ fn execute_tls(nt_ptr: *mut IMAGE_NT_HEADERS, mem_module: *mut MemoryModule,
     unsafe {
         let load_tls = example!(tls_wrapper_func, PLoadLibraryA);
         let mut dir_temp = std::ptr::read(dir_buf.as_mut_ptr() as *const _);
-        let mut tls_directory: &mut IMAGE_TLS_DIRECTORY = &mut dir_temp;
+        let tls_directory: &mut IMAGE_TLS_DIRECTORY = &mut dir_temp;
         let mut tls_callback_ptr =  (*tls_directory).AddressOfCallBacks ; 
         println!("tls_callback_ptr {:#x}", tls_callback_ptr);
         if tls_callback_ptr != 0 {
             let buf_size = mem::size_of::<u64>();
             let mut buf = vec![0; buf_size as usize];
             loop {
-                let _result = unsafe {_default_memread(
+                let _result = _default_memread(
                     proc_handle,
                     tls_callback_ptr as LPCVOID,
                     buf.as_mut_ptr() as LPVOID,
                     buf_size,
-                    &mut bytes_read)};
+                    &mut bytes_read);
                 let mut temp = std::ptr::read(buf.as_mut_ptr() as *const u64);
-                let mut tls_callback_func_ptr = &mut temp;
+                let tls_callback_func_ptr = &mut temp;
 
                 // TODO fix up this shit 
                 println!("tls_callback_func_ptr {:#x}", (*tls_callback_func_ptr) as u64);
@@ -1672,13 +1584,13 @@ fn memory_loadlibrary_ex(
     // Memory block may not span 4 GB boundaries (64 bit only)
     let mut blocked_memory = PointerList{
         next: None,
-        address: NULL,
+        _address: NULL,
     };
     let mut count = 0;
     while code as u64 >> 32 < (code as u64 + aligned_image_size) >> 32 {
         let next = PointerList{
             next: None,
-            address: code,
+            _address: code,
         };
         blocked_memory.next = Some(Box::new(next));
         code = unsafe { virtual_alloc(
@@ -1700,8 +1612,8 @@ fn memory_loadlibrary_ex(
         header_base: NULL,
         code_base: code,
         h_prochandle: target_handle,
-        h_module: NULL,
-        num_modules: 0,
+        _h_module: NULL,
+        _num_modules: 0,
         initialized: false,
         is_dll: !(file_header.Characteristics & IMAGE_FILE_DLL == 0),
         is_relocated: false,
@@ -1712,10 +1624,10 @@ fn memory_loadlibrary_ex(
             _virtual_alloc: virtual_alloc,
             _virtal_free: virtal_free,
         },
-        export_table: Vec::<ExportNameEntry>::new(),
+        _export_table: Vec::<ExportNameEntry>::new(),
         entry_point: None,
         page_size: sysinfo.dwPageSize,
-        blocked_memory: Some(blocked_memory),
+        _blocked_memory: Some(blocked_memory),
     };
 
     // commit memory for headers
@@ -1831,10 +1743,13 @@ fn memory_loadlibrary_ex(
     1
 }
 
-fn memory_get_proc_address()->u64{
+// TODO
+fn _memory_get_proc_address()->u64{
     0
 }
-fn memory_free_library()->u32{
+
+// TODO
+fn _memory_free_library()->u32{
     0
 }
 

