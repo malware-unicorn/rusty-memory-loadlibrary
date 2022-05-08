@@ -4,8 +4,10 @@
 // This is a lightweight port of https://github.com/fancycode/MemoryModule
 // TODO: Modules should strive to be below 500 lines
 
+
+// TODO: [DATE: 5/6] test remotegetprocaddress, refactor functions
 // TOOD: [DATE: 5/4] Refactor the error handling
-// TODO: [DATE: 4/15] Fix bullshit remote getprocaddress
+
 // TODO: [FUTURE] Unhook NTDLL APIs using the PEB
 extern crate winapi;
 
