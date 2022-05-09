@@ -1,12 +1,11 @@
-// cargo build --release --target x86_64-pc-windows-gnu
-// sudo apt-get install gcc-mingw-w64-x86-64
-// rustup target add x86_64-pc-windows-gnu
-// This is a lightweight port of https://github.com/fancycode/MemoryModule
-// TODO: Modules should strive to be below 500 lines
+// Lib: rusty-memory-loadlibrary
+// Author: malwareunicorn
+// Description: Map DLLs from memory into another process
+//
+// Build: cargo build --release --target x86_64-pc-windows-gnu
+// Req: sudo apt-get install gcc-mingw-w64-x86-64
+// Req: rustup target add x86_64-pc-windows-gnu
 
-// TODO: [DATE: 5/7] refactor functions
-// TOOD: [DATE: 5/4] Refactor the error handling
-// TODO: [FUTURE] Unhook NTDLL APIs using the PEB
 extern crate winapi;
 
 use field_offset::offset_of;
@@ -23,7 +22,7 @@ use std::os::windows::prelude::OsStringExt;
 use winapi::ctypes::c_void;
 use winapi::shared::basetsd::{PSIZE_T, SIZE_T};
 use winapi::shared::minwindef::{
-    BOOL, DWORD, FARPROC, HINSTANCE, HMODULE, LPCVOID, LPDWORD, LPVOID, TRUE, ULONG, WORD,FALSE
+    BOOL, DWORD, FALSE, FARPROC, HINSTANCE, HMODULE, LPCVOID, LPDWORD, LPVOID, TRUE, ULONG, WORD,
 };
 use winapi::shared::ntdef::{NTSTATUS, NULL, PHANDLE, POBJECT_ATTRIBUTES};
 use winapi::um::consoleapi::AllocConsole;
@@ -41,7 +40,7 @@ use winapi::um::sysinfoapi::{GetNativeSystemInfo, SYSTEM_INFO};
 use winapi::um::winbase::INFINITE;
 use winapi::um::wincon::FreeConsole;
 use winapi::um::winnt::{
-    ACCESS_MASK, DLL_PROCESS_ATTACH, HANDLE, LPCSTR, LPSTR, MEM_COMMIT, MEM_RESERVE,
+    ACCESS_MASK, DLL_PROCESS_ATTACH, HANDLE, LPCSTR, LPSTR, MEM_COMMIT, MEM_DECOMMIT, MEM_RESERVE,
     PAGE_READWRITE, PVOID,
 };
 use winapi::um::winnt::{
@@ -58,8 +57,26 @@ use winapi::um::winnt::{
 };
 use winapi::vc::vcruntime::ptrdiff_t;
 
+pub const DOS_SIGNATURE: u16 = 0x5a4d;
+pub const PE_SIGNATURE: u32 = 0x00004550;
+pub const MAX_DLL_NAME: usize = 33;
+pub const _MAX_DLL_FUNC_NAME: usize = 63;
+
+const PROTECTION_FLAGS: [[[u32; 2]; 2]; 2] = [
+    [
+        // not executable
+        [PAGE_NOACCESS, PAGE_WRITECOPY],
+        [PAGE_READONLY, PAGE_READWRITE],
+    ],
+    [
+        // executable
+        [PAGE_EXECUTE, PAGE_EXECUTE_WRITECOPY],
+        [PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE],
+    ],
+];
+
 // Convert address into function
-macro_rules! example {
+macro_rules! addr_2_func {
     ($address:expr, $t:ty) => {
         std::mem::transmute::<*const (), $t>($address as _)
     };
@@ -121,9 +138,9 @@ type _DllEntryProc = unsafe extern "system" fn(
 ) -> BOOL;
 
 struct FunctionMap {
-    //openprocess: POpenProcess,
-    //writemem: PNtWriteVirtualMemory,
-    //createthread: PNtCreateThreadEx,
+    //openprocess: POpenProcess, TODO
+    //writemem: PNtWriteVirtualMemory, TODO
+    //createthread: PNtCreateThreadEx, TODO
     _load_libary: PLoadLibraryA,
     _get_proc_address: PCustomGetProcAddress,
     _free_libary: PFreeLibary,
@@ -145,8 +162,7 @@ pub struct MemoryModule {
     header_base: LPVOID,
     code_base: LPVOID,
     h_prochandle: HANDLE,
-    _h_module: PVOID,
-    _num_modules: u32,
+    h_modules: Vec<HMODULE>,
     initialized: bool,
     is_dll: bool,
     is_relocated: bool,
@@ -165,31 +181,364 @@ struct SectionFinalizedData {
     last: bool,
 }
 
-pub const DOS_SIGNATURE: u16 = 0x5a4d;
-pub const PE_SIGNATURE: u32 = 0x00004550;
-pub const MAX_DLL_NAME: usize = 33;
-pub const _MAX_DLL_FUNC_NAME: usize = 63;
+pub fn _memory_loadlibary(data: PVOID, size: u32) -> u32 {
+    return memory_loadlibrary_ex(
+        data,
+        size,
+        _default_loadlibrary,
+        _default_getprocaddress,
+        _default_freelibrary,
+        _default_virtualalloc,
+        _default_virtualfree,
+        NULL,
+    );
+}
 
-const PROTECTION_FLAGS: [[[u32; 2]; 2]; 2] = [
-    [
-        // not executable
-        [PAGE_NOACCESS, PAGE_WRITECOPY],
-        [PAGE_READONLY, PAGE_READWRITE],
-    ],
-    [
-        // executable
-        [PAGE_EXECUTE, PAGE_EXECUTE_WRITECOPY],
-        [PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE],
-    ],
-];
+pub fn _memory_loadlibary_remote(data: PVOID, size: u32, phandle: HANDLE) -> u32 {
+    return memory_loadlibrary_ex(
+        data,
+        size,
+        _default_loadlibrary,
+        _default_getprocaddress,
+        _default_freelibrary,
+        _default_virtualalloc,
+        _default_virtualfree,
+        phandle,
+    );
+}
 
-// TODO: unhook later
-fn _unhook_ntdll() -> u32 {
-    0
+fn memory_loadlibrary_ex(
+    data: PVOID,
+    size: u32,
+    load_libary: PLoadLibraryA,
+    get_proc_address: PCustomGetProcAddress,
+    free_libary: PFreeLibary,
+    virtual_alloc: PVirtualAllocEx,
+    virtal_free: PVirtualFreeEx,
+    phandle: HANDLE,
+) -> u32 {
+    let mut target_handle: HANDLE = phandle;
+
+    // Check Size
+    if check_size(size as u64, mem::size_of::<IMAGE_DOS_HEADER>() as u64) {
+        return 0;
+    }
+    let dos_ptr = data as *mut IMAGE_DOS_HEADER;
+    let magic = unsafe { (*dos_ptr).e_magic };
+    if DOS_SIGNATURE != magic {
+        println!("DOS_SIGNATURE failed!");
+        return 0;
+    }
+    let nt_hdr_offset = unsafe { (*dos_ptr).e_lfanew };
+    let nt_ptr = (data as u64 + nt_hdr_offset as u64) as *mut IMAGE_NT_HEADERS;
+    if check_size(
+        size as u64,
+        nt_hdr_offset as u64 + mem::size_of::<IMAGE_NT_HEADERS>() as u64,
+    ) {
+        println!("check_size failed!");
+        return 0;
+    }
+    let pe_sig = unsafe { (*nt_ptr).Signature };
+    if PE_SIGNATURE != pe_sig {
+        println!("PE_SIGNATURE failed!");
+        return 0;
+    }
+    let mut file_header = unsafe { (*nt_ptr).FileHeader };
+    if file_header.Machine != IMAGE_FILE_MACHINE_AMD64 {
+        println!("IMAGE_FILE_MACHINE_AMD64 failed!");
+        return 0;
+    }
+    // Only support section alignments that are a multiple of 2
+    let optional_header = unsafe { (*nt_ptr).OptionalHeader };
+    let section_align = optional_header.SectionAlignment;
+    if section_align & 1 == 1 {
+        println!("section_align failed!");
+        return 0;
+    }
+    let last_section_end = get_end_of_sections(nt_ptr, &file_header, section_align);
+
+    let mut sysinfo: SYSTEM_INFO = unsafe { mem::zeroed() };
+    unsafe { GetNativeSystemInfo(&mut sysinfo) };
+    let aligned_image_size = align_value_up(
+        optional_header.SizeOfImage.into(),
+        sysinfo.dwPageSize as u64,
+    );
+    if aligned_image_size != align_value_up(last_section_end as u64, sysinfo.dwPageSize as u64) {
+        println!("section end is not matching failed!");
+        return 0;
+    }
+
+    // reserve memory for image of library
+    if target_handle == NULL {
+        target_handle = unsafe { GetCurrentProcess() };
+    }
+    let mut code = unsafe {
+        virtual_alloc(
+            target_handle,
+            //optional_header.ImageBase as PVOID,
+            NULL,
+            aligned_image_size as usize,
+            (MEM_RESERVE | MEM_COMMIT) as u32,
+            PAGE_READWRITE,
+        )
+    };
+
+    if code == NULL {
+        // try to allocate memory at arbitrary position
+        code = unsafe {
+            virtual_alloc(
+                target_handle,
+                NULL,
+                aligned_image_size as usize,
+                (MEM_RESERVE | MEM_COMMIT) as u32,
+                PAGE_READWRITE,
+            )
+        };
+        if code == NULL {
+            return 0;
+        }
+    }
+    // Memory block may not span 4 GB boundaries (64 bit only)
+    let mut blocked_memory = PointerList {
+        next: None,
+        _address: NULL,
+    };
+    let mut count = 0;
+    while code as u64 >> 32 < (code as u64 + aligned_image_size) >> 32 {
+        let next = PointerList {
+            next: None,
+            _address: code,
+        };
+        blocked_memory.next = Some(Box::new(next));
+        code = unsafe {
+            virtual_alloc(
+                target_handle,
+                NULL,
+                aligned_image_size as usize,
+                (MEM_RESERVE | MEM_COMMIT) as u32,
+                PAGE_READWRITE,
+            )
+        };
+        count = count + 1;
+        if code == NULL {
+            return 0;
+        }
+    }
+    // End 64bit
+
+    let mut memory_module = MemoryModule {
+        header_base: NULL,
+        code_base: code,
+        h_prochandle: target_handle,
+        h_modules: Vec::<HMODULE>::new(),
+        initialized: false,
+        is_dll: !(file_header.Characteristics & IMAGE_FILE_DLL == 0),
+        is_relocated: false,
+        functions: FunctionMap {
+            _load_libary: load_libary,
+            _get_proc_address: get_proc_address,
+            _free_libary: free_libary,
+            _virtual_alloc: virtual_alloc,
+            _virtal_free: virtal_free,
+        },
+        _export_table: Vec::<ExportNameEntry>::new(),
+        entry_point: None,
+        page_size: sysinfo.dwPageSize,
+        _blocked_memory: Some(blocked_memory),
+    };
+
+    // commit memory for headers
+    if check_size(size as u64, optional_header.SizeOfHeaders as u64) {
+        return 0;
+    }
+    let header_mem = unsafe {
+        virtual_alloc(
+            target_handle,
+            code,
+            optional_header.SizeOfHeaders as usize,
+            MEM_COMMIT as u32,
+            PAGE_READWRITE,
+        )
+    };
+
+    // update imagebase
+    let old_image_base = optional_header.ImageBase;
+    unsafe { (*nt_ptr).OptionalHeader.ImageBase = code as u64 };
+    let new_image_base = unsafe { (*nt_ptr).OptionalHeader.ImageBase };
+    println!("New ImageBase: {:#x}", new_image_base);
+
+    // copy PE header to code
+    let mut bytes_written: usize = 0;
+    let _status = unsafe {
+        _default_memwrite(
+            target_handle,
+            code,
+            data as LPCVOID,
+            optional_header.SizeOfHeaders as usize,
+            &mut bytes_written,
+        )
+    };
+
+    // Offset to IMAGE_NT_HEADERS
+    memory_module.header_base = (header_mem as u64 + nt_hdr_offset as u64) as LPVOID;
+
+    // copy sections from DLL file block to new memory location
+    if !copy_sections(
+        data,
+        size as usize,
+        nt_ptr,
+        &mut file_header,
+        section_align,
+        &mut memory_module,
+    ) {
+        println!("failed to copy sections!");
+        return 0;
+    }
+
+    // adjust base address of imported data
+    let location_delta: ptrdiff_t = (new_image_base - old_image_base) as ptrdiff_t;
+    if location_delta != 0 {
+        memory_module.is_relocated =
+            perform_base_relocations(nt_ptr, &mut memory_module, location_delta);
+    } else {
+        memory_module.is_relocated = true;
+    }
+    // load required dlls and adjust function table of imports
+    if !build_import_table(nt_ptr, &mut memory_module) {
+        println!("build_import_table failed!");
+        return 0;
+    }
+    // mark memory pages depending on section headers and release
+    // sections that are marked as "discardable"
+    if !finalize_sections(nt_ptr, &mut file_header, &mut memory_module) {
+        println!("finalize_sections failed!");
+        return 0;
+    }
+
+    let (shellcode_func_wrapper, parameter_ptr) = create_func_wrapper(&mut memory_module);
+    // TLS callbacks are executed BEFORE the main loading
+    if !execute_tls(
+        nt_ptr,
+        &mut memory_module,
+        shellcode_func_wrapper,
+        parameter_ptr,
+    ) {
+        return 0;
+    }
+
+    // get entry point of loaded library
+    if optional_header.AddressOfEntryPoint != 0 {
+        let dll_entry_ptr =
+            memory_module.code_base as u64 + optional_header.AddressOfEntryPoint as u64;
+        if memory_module.is_dll {
+            unsafe {
+                let dll_entry_func = addr_2_func!(shellcode_func_wrapper, PLoadLibraryA);
+                let _status = setup_wrapper_params(
+                    &mut memory_module,
+                    parameter_ptr,
+                    dll_entry_ptr,
+                    memory_module.code_base as u64,
+                    DLL_PROCESS_ATTACH as u64,
+                    0,
+                );
+                let remote_thread = CreateRemoteThread(
+                    memory_module.h_prochandle,
+                    std::ptr::null_mut(),
+                    0,
+                    Some(dll_entry_func),
+                    parameter_ptr as PVOID,
+                    0,
+                    std::ptr::null_mut(),
+                );
+                if remote_thread == 0 as HANDLE {
+                    println!("dll_entry_ptr remote_thread failed");
+                    return 0;
+                }
+                WaitForSingleObject(remote_thread, INFINITE);
+            }
+            memory_module.initialized = true;
+        } else {
+            // Is EXE
+            let entry_func = unsafe { addr_2_func!(dll_entry_ptr, ExeEntryProc) };
+            memory_module.entry_point = Some(entry_func);
+        }
+    } else {
+        memory_module.entry_point = None;
+    }
+    // cleanup
+    1
 }
 
 unsafe extern "system" fn _default_loadlibrary(lp_filename: PVOID) -> u32 {
     return LoadLibraryA(lp_filename as LPCSTR) as u32;
+}
+
+unsafe extern "system" fn _default_getprocaddress(
+    h_module: HMODULE,
+    lp_proc_name: LPCSTR,
+) -> FARPROC {
+    return GetProcAddress(h_module, lp_proc_name);
+}
+
+unsafe extern "system" fn _default_freelibrary(h_module: HMODULE) -> BOOL {
+    return FreeLibrary(h_module);
+}
+
+unsafe extern "system" fn _default_virtualalloc(
+    h_process: HANDLE,
+    lp_address: LPVOID,
+    dw_size: SIZE_T,
+    fl_allocation_type: DWORD,
+    fl_protect: DWORD,
+) -> LPVOID {
+    return VirtualAllocEx(
+        h_process,
+        lp_address,
+        dw_size,
+        fl_allocation_type,
+        fl_protect,
+    );
+}
+
+unsafe extern "system" fn _default_virtualfree(
+    h_process: HANDLE,
+    lp_address: LPVOID,
+    dw_size: SIZE_T,
+    dw_free_type: DWORD,
+) -> BOOL {
+    return VirtualFreeEx(h_process, lp_address, dw_size, dw_free_type);
+}
+
+unsafe extern "system" fn _default_memwrite(
+    h_process: HANDLE,
+    base_address: LPVOID,
+    buffer: LPCVOID,
+    buffer_size: SIZE_T,
+    num_bytes_written: PSIZE_T,
+) -> NTSTATUS {
+    return WriteProcessMemory(
+        h_process,
+        base_address,
+        buffer,
+        buffer_size,
+        num_bytes_written,
+    );
+}
+
+unsafe extern "system" fn _default_memread(
+    h_process: HANDLE,
+    base_address: LPCVOID,
+    buffer: LPVOID,
+    buffer_size: SIZE_T,
+    num_bytes_written: PSIZE_T,
+) -> BOOL {
+    return ReadProcessMemory(
+        h_process,
+        base_address,
+        buffer,
+        buffer_size,
+        num_bytes_written,
+    );
 }
 
 // Load the library with createremotethread
@@ -206,7 +555,7 @@ pub unsafe fn _remotethread_loadlibrary(
     let h_kernel = _sneaky_loadlibrary(mem_module, "kernel32.dll");
     let proc_name = CString::new("LoadLibraryA").unwrap();
     let loadlibrary_addr = get_proc_addr(h_kernel, proc_name.as_ptr());
-    let loadlib = example!(loadlibrary_addr, PLoadLibraryA);
+    let loadlib = addr_2_func!(loadlibrary_addr, PLoadLibraryA);
     // write path to remote process
     let dll_path_buf = lp_filename.as_bytes().to_vec();
     let buf_len = dll_path_buf.len();
@@ -350,14 +699,7 @@ pub unsafe fn _sneaky_loadlibrary(mem_module: *mut MemoryModule, lp_filename: &s
     0 as HMODULE
 }
 
-unsafe extern "system" fn _default_getprocaddress(
-    h_module: HMODULE,
-    lp_proc_name: LPCSTR,
-) -> FARPROC {
-    return GetProcAddress(h_module, lp_proc_name);
-}
-
-// TODO error handling
+// Helper function for reading a struct remotely
 unsafe fn remote_struct_read<T>(proc_handle: HANDLE, ptr_address: u64) -> Option<Vec<u8>> {
     let mut bytes_read: usize = 0;
     let mut buf = vec![0u8; mem::size_of::<T>()];
@@ -479,7 +821,6 @@ unsafe fn get_forwarded_procaddress(
 
 // ref: https://www.codeproject.com/Tips/139349/Getting-the-address-of-a-function-in-a-DLL-loaded
 // 64bit only
-// TODO: function too big
 pub unsafe fn _remote_getprocaddress(
     mem_module: *mut MemoryModule,
     h_module: HMODULE,
@@ -636,93 +977,6 @@ pub unsafe fn _remote_getprocaddress(
     proc_address
 }
 
-unsafe extern "system" fn _default_freelibrary(h_module: HMODULE) -> BOOL {
-    return FreeLibrary(h_module);
-}
-
-unsafe extern "system" fn _default_virtualalloc(
-    h_process: HANDLE,
-    lp_address: LPVOID,
-    dw_size: SIZE_T,
-    fl_allocation_type: DWORD,
-    fl_protect: DWORD,
-) -> LPVOID {
-    return VirtualAllocEx(
-        h_process,
-        lp_address,
-        dw_size,
-        fl_allocation_type,
-        fl_protect,
-    );
-}
-
-unsafe extern "system" fn _default_virtualfree(
-    h_process: HANDLE,
-    lp_address: LPVOID,
-    dw_size: SIZE_T,
-    dw_free_type: DWORD,
-) -> BOOL {
-    return VirtualFreeEx(h_process, lp_address, dw_size, dw_free_type);
-}
-
-unsafe extern "system" fn _default_memwrite(
-    h_process: HANDLE,
-    base_address: LPVOID,
-    buffer: LPCVOID,
-    buffer_size: SIZE_T,
-    num_bytes_written: PSIZE_T,
-) -> NTSTATUS {
-    return WriteProcessMemory(
-        h_process,
-        base_address,
-        buffer,
-        buffer_size,
-        num_bytes_written,
-    );
-}
-
-unsafe extern "system" fn _default_memread(
-    h_process: HANDLE,
-    base_address: LPCVOID,
-    buffer: LPVOID,
-    buffer_size: SIZE_T,
-    num_bytes_written: PSIZE_T,
-) -> BOOL {
-    return ReadProcessMemory(
-        h_process,
-        base_address,
-        buffer,
-        buffer_size,
-        num_bytes_written,
-    );
-}
-
-pub fn _memory_loadlibary(data: PVOID, size: u32) -> u32 {
-    return memory_loadlibrary_ex(
-        data,
-        size,
-        _default_loadlibrary,
-        _default_getprocaddress,
-        _default_freelibrary,
-        _default_virtualalloc,
-        _default_virtualfree,
-        NULL,
-    );
-}
-
-pub fn _memory_loadlibary_remote(data: PVOID, size: u32, phandle: HANDLE) -> u32 {
-    return memory_loadlibrary_ex(
-        data,
-        size,
-        _default_loadlibrary,
-        _default_getprocaddress,
-        _default_freelibrary,
-        _default_virtualalloc,
-        _default_virtualfree,
-        phandle,
-    );
-}
-
 // Helper function to check the size
 fn check_size(size: u64, expected: u64) -> bool {
     if size < expected {
@@ -732,16 +986,17 @@ fn check_size(size: u64, expected: u64) -> bool {
     return false;
 }
 
-// Helper function to allign virtual allocs
+// Helper function to align virtual allocs
 fn align_value_up(value: u64, alignment: u64) -> u64 {
     return (value + alignment - 1) & !(alignment - 1);
 }
 
-// Helper function to allign virtual allocs
+// Helper function to align virtual allocs
 fn align_address_down(value: u64, alignment: u64) -> u64 {
     return value & !(alignment - 1);
 }
 
+// This copies the section data to the virtualalloc locations
 // TODO: function too big, refactor later
 fn copy_sections(
     data: PVOID,
@@ -757,11 +1012,10 @@ fn copy_sections(
 
     let mut image_first_section_ptr = get_first_section_ptr(nt_ptr, file_header);
     let mut section: IMAGE_SECTION_HEADER = unsafe { *image_first_section_ptr };
-    let mut i = 0;
     let num_sections = unsafe { (*file_header).NumberOfSections };
     let mut _dest: PVOID = 0 as PVOID;
 
-    while i < num_sections {
+    for _i in 0..num_sections {
         // section doesn't contain data in the dll itself, but may define
         // uninitialized data
         if section.SizeOfRawData == 0 {
@@ -842,12 +1096,10 @@ fn copy_sections(
                 )
             };
         }
-
         image_first_section_ptr = (image_first_section_ptr as u64
             + mem::size_of::<IMAGE_SECTION_HEADER>() as u64)
             as *mut IMAGE_SECTION_HEADER;
         section = unsafe { *image_first_section_ptr };
-        i = i + 1;
     }
     true
 }
@@ -875,12 +1127,10 @@ fn get_end_of_sections(
     section_align: u32,
 ) -> u64 {
     let mut last_section_end = 0;
-
     let mut image_first_section_ptr = get_first_section_ptr(nt_ptr, file_header);
     let mut section: IMAGE_SECTION_HEADER = unsafe { *image_first_section_ptr };
-    let mut i = 0;
     let num_sections = unsafe { (*file_header).NumberOfSections };
-    while i < num_sections {
+    for _i in 0..num_sections {
         let mut _end_of_section = 0;
         if section.SizeOfRawData == 0 {
             _end_of_section = section.VirtualAddress + section_align;
@@ -890,12 +1140,10 @@ fn get_end_of_sections(
         if _end_of_section > last_section_end {
             last_section_end = _end_of_section;
         }
-
         image_first_section_ptr = (image_first_section_ptr as u64
             + mem::size_of::<IMAGE_SECTION_HEADER>() as u64)
             as *mut IMAGE_SECTION_HEADER;
         section = unsafe { *image_first_section_ptr };
-        i = i + 1;
     }
     last_section_end.into()
 }
@@ -913,6 +1161,7 @@ fn offset_pointer(data: PVOID, offset: ptrdiff_t) -> PVOID {
     return (data as ptrdiff_t + offset) as PVOID;
 }
 
+// Overwrite the header addreses with the new locations
 fn perform_base_relocations(
     nt_ptr: *mut IMAGE_NT_HEADERS,
     mem_module: *mut MemoryModule,
@@ -930,11 +1179,13 @@ fn perform_base_relocations(
     }
     let mut relocation_ptr = unsafe { code_base as u64 + (*directory).VirtualAddress as u64 };
     let reloc_size = mem::size_of::<IMAGE_BASE_RELOCATION>();
-    let mut buf = unsafe { match remote_struct_read::<IMAGE_BASE_RELOCATION>(proc_handle, relocation_ptr) {
-        Some(b) => b,
-        _ => return false,
-    } };
-    
+    let mut buf = unsafe {
+        match remote_struct_read::<IMAGE_BASE_RELOCATION>(proc_handle, relocation_ptr) {
+            Some(b) => b,
+            _ => return false,
+        }
+    };
+
     unsafe {
         let mut temp = std::ptr::read(buf.as_mut_ptr() as *const _);
         let mut relocation: &mut IMAGE_BASE_RELOCATION = &mut temp;
@@ -942,7 +1193,6 @@ fn perform_base_relocations(
             let dest = code_base as u64 + (*relocation).VirtualAddress as u64;
             let mut rel_info_ptr =
                 offset_pointer(relocation_ptr as PVOID, reloc_size as isize) as u64;
-            
             let size_of_block = (*relocation).SizeOfBlock;
             let block_len = ((size_of_block as usize - reloc_size) / 2) as usize;
             for _i in 0..block_len {
@@ -991,7 +1241,7 @@ fn perform_base_relocations(
                         let mut bytes_written = 0;
                         let new_patch = (*addr_hl_info) as isize + delta;
                         let delta_buf = ((new_patch as u64).to_le_bytes()).to_vec();
-                        let _status = _default_memwrite(
+                        _default_memwrite(
                             proc_handle,
                             patch_addr_hl as LPVOID,
                             delta_buf.as_ptr() as LPCVOID,
@@ -1004,7 +1254,6 @@ fn perform_base_relocations(
                 };
 
                 rel_info_ptr = rel_info_ptr + mem::size_of::<u16>() as u64;
-                
             }
             relocation_ptr = offset_pointer(relocation_ptr as PVOID, size_of_block as isize) as u64;
             _default_memread(
@@ -1102,10 +1351,11 @@ fn build_import_table(nt_ptr: *mut IMAGE_NT_HEADERS, mem_module: *mut MemoryModu
                     return false;
                 }
             }
-            // TODO: add to list of modules
+            // Add to list of modules
+            (*mem_module).h_modules.push(dll_module);
             let mut _thunk_ref: u64 = 0;
             let mut _func_ref: u64 = 0;
-            let original_first_thunk: u64 = *((*import_desc).u.OriginalFirstThunk()) as u64; //TODO: see if this works in remote process
+            let original_first_thunk: u64 = *((*import_desc).u.OriginalFirstThunk()) as u64;
             let first_thunk = (*import_desc).FirstThunk as u64;
             if original_first_thunk != 0 {
                 _thunk_ref = code_base + original_first_thunk;
@@ -1168,7 +1418,6 @@ fn build_import_table(nt_ptr: *mut IMAGE_NT_HEADERS, mem_module: *mut MemoryModu
                         proc_addr =
                             _remote_getprocaddress(mem_module, dll_module, funcname_str, 0, false);
                     }
-
                     // write thunk_ref
                     let mut bytes_written = 0;
                     let func_ref_value = (proc_addr.to_le_bytes()).to_vec();
@@ -1224,6 +1473,7 @@ fn finalize_section(
     section_data: &SectionFinalizedData,
 ) -> bool {
     let proc_handle = unsafe { (*mem_module).h_prochandle };
+    let virtual_free = unsafe { (*mem_module).functions._virtal_free };
     if (*section_data).size == 0 {
         return true;
     }
@@ -1235,7 +1485,14 @@ fn finalize_section(
             || (*section_data).size % page_size == 0
         {
             // Only allowed to decommit whole pages
-            // TODO: free pages
+            unsafe {
+                virtual_free(
+                    proc_handle,
+                    (*section_data).address as LPVOID,
+                    (*section_data).size,
+                    MEM_DECOMMIT,
+                )
+            };
         }
         return true;
     }
@@ -1250,7 +1507,7 @@ fn finalize_section(
     let mut old_protect: u32 = protect;
     // change memory access flags
     unsafe {
-    match VirtualProtectEx(
+        match VirtualProtectEx(
             proc_handle,
             (*section_data).address as LPVOID,
             (*section_data).size,
@@ -1476,7 +1733,7 @@ fn execute_tls(
         return false;
     }
     unsafe {
-        let load_tls = example!(tls_wrapper_func, PLoadLibraryA);
+        let load_tls = addr_2_func!(tls_wrapper_func, PLoadLibraryA);
         let mut dir_temp = std::ptr::read(dir_buf.as_mut_ptr() as *const _);
         let tls_directory: &mut IMAGE_TLS_DIRECTORY = &mut dir_temp;
         let mut tls_callback_ptr = (*tls_directory).AddressOfCallBacks;
@@ -1525,272 +1782,7 @@ fn execute_tls(
     true
 }
 
-fn memory_loadlibrary_ex(
-    data: PVOID,
-    size: u32,
-    load_libary: PLoadLibraryA,
-    get_proc_address: PCustomGetProcAddress,
-    free_libary: PFreeLibary,
-    virtual_alloc: PVirtualAllocEx,
-    virtal_free: PVirtualFreeEx,
-    phandle: HANDLE,
-) -> u32 {
-    let mut target_handle: HANDLE = phandle;
 
-    // Check Size
-    if check_size(size as u64, mem::size_of::<IMAGE_DOS_HEADER>() as u64) {
-        return 0;
-    }
-    let dos_ptr = data as *mut IMAGE_DOS_HEADER;
-    let magic = unsafe { (*dos_ptr).e_magic };
-    if DOS_SIGNATURE != magic {
-        println!("DOS_SIGNATURE failed!");
-        return 0;
-    }
-    let nt_hdr_offset = unsafe { (*dos_ptr).e_lfanew };
-    let nt_ptr = (data as u64 + nt_hdr_offset as u64) as *mut IMAGE_NT_HEADERS;
-    if check_size(
-        size as u64,
-        nt_hdr_offset as u64 + mem::size_of::<IMAGE_NT_HEADERS>() as u64,
-    ) {
-        println!("check_size failed!");
-        return 0;
-    }
-    let pe_sig = unsafe { (*nt_ptr).Signature };
-    if PE_SIGNATURE != pe_sig {
-        println!("PE_SIGNATURE failed!");
-        return 0;
-    }
-    let mut file_header = unsafe { (*nt_ptr).FileHeader };
-    if file_header.Machine != IMAGE_FILE_MACHINE_AMD64 {
-        println!("IMAGE_FILE_MACHINE_AMD64 failed!");
-        return 0;
-    }
-    // Only support section alignments that are a multiple of 2
-    let optional_header = unsafe { (*nt_ptr).OptionalHeader };
-    let section_align = optional_header.SectionAlignment;
-    if section_align & 1 == 1 {
-        println!("section_align failed!");
-        return 0;
-    }
-    let last_section_end = get_end_of_sections(nt_ptr, &file_header, section_align);
-
-    let mut sysinfo: SYSTEM_INFO = unsafe { mem::zeroed() };
-    unsafe { GetNativeSystemInfo(&mut sysinfo) };
-    let aligned_image_size = align_value_up(
-        optional_header.SizeOfImage.into(),
-        sysinfo.dwPageSize as u64,
-    );
-    if aligned_image_size != align_value_up(last_section_end as u64, sysinfo.dwPageSize as u64) {
-        println!("section end is not matching failed!");
-        return 0;
-    }
-
-    // reserve memory for image of library
-    if target_handle == NULL {
-        target_handle = unsafe { GetCurrentProcess() };
-    }
-    let mut code = unsafe {
-        virtual_alloc(
-            target_handle,
-            //optional_header.ImageBase as PVOID,
-            NULL,
-            aligned_image_size as usize,
-            (MEM_RESERVE | MEM_COMMIT) as u32,
-            PAGE_READWRITE,
-        )
-    };
-
-    if code == NULL {
-        // try to allocate memory at arbitrary position
-        code = unsafe {
-            virtual_alloc(
-                target_handle,
-                NULL,
-                aligned_image_size as usize,
-                (MEM_RESERVE | MEM_COMMIT) as u32,
-                PAGE_READWRITE,
-            )
-        };
-        if code == NULL {
-            return 0;
-        }
-    }
-    // Memory block may not span 4 GB boundaries (64 bit only)
-    let mut blocked_memory = PointerList {
-        next: None,
-        _address: NULL,
-    };
-    let mut count = 0;
-    while code as u64 >> 32 < (code as u64 + aligned_image_size) >> 32 {
-        let next = PointerList {
-            next: None,
-            _address: code,
-        };
-        blocked_memory.next = Some(Box::new(next));
-        code = unsafe {
-            virtual_alloc(
-                target_handle,
-                NULL,
-                aligned_image_size as usize,
-                (MEM_RESERVE | MEM_COMMIT) as u32,
-                PAGE_READWRITE,
-            )
-        };
-        count = count + 1;
-        if code == NULL {
-            return 0;
-        }
-    }
-    // End 64bit
-
-    let mut memory_module = MemoryModule {
-        header_base: NULL,
-        code_base: code,
-        h_prochandle: target_handle,
-        _h_module: NULL,
-        _num_modules: 0,
-        initialized: false,
-        is_dll: !(file_header.Characteristics & IMAGE_FILE_DLL == 0),
-        is_relocated: false,
-        functions: FunctionMap {
-            _load_libary: load_libary,
-            _get_proc_address: get_proc_address,
-            _free_libary: free_libary,
-            _virtual_alloc: virtual_alloc,
-            _virtal_free: virtal_free,
-        },
-        _export_table: Vec::<ExportNameEntry>::new(),
-        entry_point: None,
-        page_size: sysinfo.dwPageSize,
-        _blocked_memory: Some(blocked_memory),
-    };
-
-    // commit memory for headers
-    if check_size(size as u64, optional_header.SizeOfHeaders as u64) {
-        return 0;
-    }
-    let header_mem = unsafe {
-        virtual_alloc(
-            target_handle,
-            code,
-            optional_header.SizeOfHeaders as usize,
-            MEM_COMMIT as u32,
-            PAGE_READWRITE,
-        )
-    };
-
-    // update imagebase
-    let old_image_base = optional_header.ImageBase;
-    unsafe { (*nt_ptr).OptionalHeader.ImageBase = code as u64 };
-    let new_image_base = unsafe { (*nt_ptr).OptionalHeader.ImageBase };
-    println!("New ImageBase: {:#x}", new_image_base);
-
-    // copy PE header to code
-    let mut bytes_written: usize = 0;
-    let _status = unsafe {
-        _default_memwrite(
-            target_handle,
-            code,
-            data as LPCVOID,
-            optional_header.SizeOfHeaders as usize,
-            &mut bytes_written,
-        )
-    };
-
-    // Offset to IMAGE_NT_HEADERS
-    memory_module.header_base = (header_mem as u64 + nt_hdr_offset as u64) as LPVOID;
-
-    // copy sections from DLL file block to new memory location
-    if !copy_sections(
-        data,
-        size as usize,
-        nt_ptr,
-        &mut file_header,
-        section_align,
-        &mut memory_module,
-    ) {
-        println!("failed to copy sections!");
-        return 0;
-    }
-
-    // adjust base address of imported data
-    let location_delta: ptrdiff_t = (new_image_base - old_image_base) as ptrdiff_t;
-    if location_delta != 0 {
-        memory_module.is_relocated =
-            perform_base_relocations(nt_ptr, &mut memory_module, location_delta);
-    } else {
-        memory_module.is_relocated = true;
-    }
-
-    // load required dlls and adjust function table of imports
-    if !build_import_table(nt_ptr, &mut memory_module) {
-        println!("build_import_table failed!");
-        return 0;
-    }
-    // mark memory pages depending on section headers and release
-    // sections that are marked as "discardable"
-    if !finalize_sections(nt_ptr, &mut file_header, &mut memory_module) {
-        println!("finalize_sections failed!");
-        return 0;
-    }
-
-    let (shellcode_func_wrapper, parameter_ptr) = create_func_wrapper(&mut memory_module);
-    // TLS callbacks are executed BEFORE the main loading
-    if !execute_tls(
-        nt_ptr,
-        &mut memory_module,
-        shellcode_func_wrapper,
-        parameter_ptr,
-    ) {
-        return 0;
-    }
-
-    // get entry point of loaded library
-    if optional_header.AddressOfEntryPoint != 0 {
-        let dll_entry_ptr =
-            memory_module.code_base as u64 + optional_header.AddressOfEntryPoint as u64;
-        if memory_module.is_dll {
-            unsafe {
-                let dll_entry_func = example!(shellcode_func_wrapper, PLoadLibraryA);
-
-                let _status = setup_wrapper_params(
-                    &mut memory_module,
-                    parameter_ptr,
-                    dll_entry_ptr,
-                    memory_module.code_base as u64,
-                    DLL_PROCESS_ATTACH as u64,
-                    0,
-                );
-
-                //Sleep(0x6000);
-                let remote_thread = CreateRemoteThread(
-                    memory_module.h_prochandle,
-                    std::ptr::null_mut(),
-                    0,
-                    Some(dll_entry_func),
-                    parameter_ptr as PVOID,
-                    0,
-                    std::ptr::null_mut(),
-                );
-                if remote_thread == 0 as HANDLE {
-                    println!("dll_entry_ptr remote_thread failed");
-                    return 0;
-                }
-                WaitForSingleObject(remote_thread, INFINITE);
-            }
-            memory_module.initialized = true;
-        } else {
-            let entry_func = unsafe { example!(dll_entry_ptr, ExeEntryProc) };
-            memory_module.entry_point = Some(entry_func);
-        }
-    } else {
-        memory_module.entry_point = None;
-    }
-
-    // cleanup
-    1
-}
 
 // TODO
 fn _memory_get_proc_address() -> u64 {
@@ -1829,4 +1821,11 @@ extern "stdcall" fn DllMain(
         });
     }
     TRUE
+}
+
+
+// TODO: unhook later
+// TODO: [FUTURE] Unhook NTDLL APIs using the PEB
+fn _unhook_ntdll() -> u32 {
+    0
 }
